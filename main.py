@@ -102,6 +102,22 @@ def back_button():
     )
 
 # ========== SSH ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def parse_connection_string(conn_str: str):
+    """Разбирает строку подключения на компоненты"""
+    try:
+        if ':' in conn_str:
+            # Формат user@host:port
+            user_host, port = conn_str.rsplit(':', 1)
+            user, host = user_host.split('@')
+            port = int(port)
+        else:
+            # Формат user@host
+            user, host = conn_str.split('@')
+            port = 22
+        return user, host, port
+    except ValueError:
+        raise ValueError("Неправильный формат. Используйте: user@host:port или user@host")
+
 async def execute_ssh_command(server_id: int, command: str) -> tuple[str, str]:
     """Выполняет команду на сервере через SSH"""
     try:
@@ -114,11 +130,16 @@ async def execute_ssh_command(server_id: int, command: str) -> tuple[str, str]:
         if not server:
             return "", "Сервер не найден"
         
+        # Разбираем строку подключения
+        user, host, port = parse_connection_string(server['connection_string'])
+        
         # Подключаемся по SSH
         async with asyncssh.connect(
-            server['connection_string'],
+            host,
+            username=user,
+            port=port,
             client_keys=[asyncssh.import_private_key(server['ssh_key'])],
-            known_hosts=None  # Отключаем проверку host key для удобства
+            known_hosts=None
         ) as conn:
             result = await conn.run(command)
             return result.stdout, result.stderr
@@ -292,16 +313,25 @@ async def process_connection_string(message: Message, state: FSMContext):
     
     data = await state.get_data()
     
+    # Парсим строку подключения
+    try:
+        user, host, port = parse_connection_string(message.text)
+    except ValueError as e:
+        await message.answer(f"❌ {str(e)}")
+        return
+    
     # Проверяем подключение
     await message.answer("🔍 Проверяем подключение к серверу...")
     
     try:
         async with asyncssh.connect(
-    message.text,
-    client_keys=[asyncssh.import_private_key(data['ssh_key'])],
-    known_hosts=None,
-    connect_timeout=10  # ← ИЗМЕНИЛ timeout на connect_timeout
-    ) as conn:
+            host,
+            username=user,
+            port=port,
+            client_keys=[asyncssh.import_private_key(data['ssh_key'])],
+            known_hosts=None,
+            connect_timeout=10
+        ) as conn:
             await conn.run("echo 'Connection test successful'")
     except Exception as e:
         await message.answer(f"❌ Ошибка подключения: {str(e)}\nПопробуйте снова.")
