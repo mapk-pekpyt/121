@@ -297,11 +297,11 @@ async def process_connection_string(message: Message, state: FSMContext):
     
     try:
         async with asyncssh.connect(
-            message.text,
-            client_keys=[asyncssh.import_private_key(data['ssh_key'])],
-            known_hosts=None,
-            timeout=10
-        ) as conn:
+    message.text,
+    client_keys=[asyncssh.import_private_key(data['ssh_key'])],
+    known_hosts=None,
+    connect_timeout=10  # ← ИЗМЕНИЛ timeout на connect_timeout
+    ) as conn:
             await conn.run("echo 'Connection test successful'")
     except Exception as e:
         await message.answer(f"❌ Ошибка подключения: {str(e)}\nПопробуйте снова.")
