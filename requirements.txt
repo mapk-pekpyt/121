@@ -1,4 +1,4 @@
-# requirements.txt
+# requirements.txt - ОБНОВЛЕННЫЙ
 aiogram==3.0.0
 asyncssh==2.14.0
 aiosqlite==0.19.0
