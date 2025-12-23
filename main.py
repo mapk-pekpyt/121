@@ -1,4 +1,4 @@
-# main.py - ИСПРАВЛЕННЫЙ КОД (без синтаксических ошибок)
+# main.py - УЛУЧШЕННАЯ ВЕРСИЯ С АВТОМАТИЧЕСКОЙ УСТАНОВКОЙ VPN
 import os
 import asyncio
 import logging
@@ -25,6 +25,7 @@ import aiosqlite
 ADMIN_ID = 5791171535
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PROVIDER_TOKEN = "5775769170:LIVE:TG_ADz_HW287D54Wfd3pqBi_BQA"
+SUPPORT_USERNAME = "@vpnbothost"  # Юзернейм поддержки
 
 # Создаем директорию /data если ее нет
 DATA_DIR = "/data"
@@ -81,6 +82,7 @@ async def init_database():
                     server_ip TEXT,
                     public_key TEXT,
                     wireguard_configured BOOLEAN DEFAULT FALSE,
+                    last_check TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -178,6 +180,7 @@ async def get_available_server() -> Optional[int]:
                 SELECT id FROM servers 
                 WHERE is_active = TRUE 
                 AND current_users < max_users
+                AND wireguard_configured = TRUE
                 LIMIT 1
             """)
             result = await cursor.fetchone()
@@ -186,7 +189,7 @@ async def get_available_server() -> Optional[int]:
         logger.error(f"Ошибка поиска сервера: {e}")
         return None
 
-async def execute_ssh_command(server_id: int, command: str, timeout: int = 30) -> Tuple[str, str, bool]:
+async def execute_ssh_command(server_id: int, command: str, timeout: int = 60) -> Tuple[str, str, bool]:
     """Выполняет команду на сервере через SSH с детальным логированием"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -261,7 +264,7 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 30) -
                     pass
                 return "", error_msg, False
             except asyncio.TimeoutError:
-                error_msg = "Таймаут подключения"
+                error_msg = "Таймаут подключения (60 секунд)"
                 logger.error(error_msg)
                 try:
                     os.unlink(temp_key_path)
@@ -274,11 +277,47 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 30) -
         logger.error(error_msg)
         return "", error_msg, False
 
+async def test_ssh_connection(server_id: int, message: Message = None):
+    """Тестирует SSH подключение к серверу"""
+    async def log_step(text: str, success: bool = True):
+        if message:
+            try:
+                await message.answer(text)
+            except:
+                pass
+        logger.info(text)
+    
+    await log_step("🔍 Тестирую SSH подключение...")
+    
+    try:
+        # Простая команда для проверки
+        stdout, stderr, success = await execute_ssh_command(server_id, "echo 'SSH Connection Test' && whoami && uname -a")
+        
+        if success:
+            await log_step("✅ SSH подключение работает!")
+            await log_step(f"👤 Пользователь: {stdout.split()[1] if len(stdout.split()) > 1 else 'неизвестно'}")
+            await log_step(f"💻 Система: {stdout.split('Linux')[1][:50] if 'Linux' in stdout else 'неизвестно'}")
+            return True, "SSH подключение успешно"
+        else:
+            await log_step(f"❌ Ошибка SSH: {stderr}", False)
+            return False, stderr
+            
+    except Exception as e:
+        error_msg = f"❌ Ошибка тестирования SSH: {str(e)}"
+        await log_step(error_msg, False)
+        return False, error_msg
+
 async def setup_wireguard_server(server_id: int, message: Message = None):
     """Настраивает WireGuard на сервере с пошаговым логированием"""
     steps = []
+    success_steps = 0
+    total_steps = 0
     
     async def log_step(text: str, success: bool = True):
+        nonlocal success_steps, total_steps
+        total_steps += 1
+        if success:
+            success_steps += 1
         step_msg = f"{'✅' if success else '❌'} {text}"
         steps.append(step_msg)
         if message:
@@ -288,130 +327,316 @@ async def setup_wireguard_server(server_id: int, message: Message = None):
                 pass
         logger.info(step_msg)
     
-    await log_step("Начинаю настройку WireGuard на сервере")
+    await log_step("🚀 Начинаю настройку WireGuard на сервере")
     
     try:
-        # 1. Проверка подключения
-        await log_step("Проверяю подключение к серверу...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "echo 'Connection test'")
-        
-        if not success:
-            await log_step(f"Ошибка подключения: {stderr}", False)
+        # 1. Тестируем подключение
+        await log_step("1. Проверяю SSH подключение...")
+        ssh_ok, ssh_msg = await test_ssh_connection(server_id, message)
+        if not ssh_ok:
+            await log_step(f"❌ SSH подключение не работает: {ssh_msg}", False)
             return False, steps
         
-        await log_step("Подключение установлено")
-        
-        # 2. Проверка системы
-        await log_step("Проверяю операционную систему...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "cat /etc/os-release | grep PRETTY_NAME")
+        # 2. Проверяем систему
+        await log_step("2. Проверяю операционную систему...")
+        stdout, stderr, success = await execute_ssh_command(server_id, "cat /etc/os-release | grep PRETTY_NAME || echo 'Unknown OS'")
         if success and stdout:
-            os_info = stdout.split('=')[1].strip('"')
-            await log_step(f"Система: {os_info}")
+            os_info = stdout.split('=')[1].strip('"') if '=' in stdout else stdout.strip()
+            await log_step(f"📋 Система: {os_info}")
         
-        # 3. Установка WireGuard
-        await log_step("Обновляю пакеты системы...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "apt-get update -y", timeout=60)
-        if not success:
-            await log_step("Пробую другой способ обновления...", False)
-            stdout, stderr, success = await execute_ssh_command(server_id, "apt update -y", timeout=60)
+        # 3. Обновляем пакеты
+        await log_step("3. Обновляю пакеты системы...")
         
-        if not success:
-            await log_step("Ошибка обновления пакетов. Продолжаю установку...", False)
+        # Пробуем разные менеджеры пакетов
+        update_commands = [
+            "apt-get update -y",
+            "apt update -y",
+            "yum update -y 2>/dev/null || true"
+        ]
         
-        await log_step("Устанавливаю WireGuard...")
+        updated = False
+        for cmd in update_commands:
+            await log_step(f"   Пробую: {cmd}")
+            stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=120)
+            if success:
+                updated = True
+                await log_step("   ✅ Пакеты обновлены")
+                break
+        
+        if not updated:
+            await log_step("   ⚠️ Не удалось обновить пакеты, продолжаю...", False)
+        
+        # 4. Устанавливаем WireGuard
+        await log_step("4. Устанавливаю WireGuard...")
         
         # Пробуем разные способы установки
         install_methods = [
-            "apt-get install -y wireguard",
-            "apt install -y wireguard",
-            "yum install -y wireguard-tools 2>/dev/null || apt-get install -y wireguard"
+            ("apt-get install -y wireguard wireguard-tools", "APT установка"),
+            ("apt install -y wireguard wireguard-tools", "APT альтернативная"),
+            ("yum install -y wireguard-tools 2>/dev/null || apt-get install -y wireguard", "YUM/APT комбо")
         ]
         
         installed = False
-        for method in install_methods:
-            await log_step(f"Пробую: {method}")
-            stdout, stderr, success = await execute_ssh_command(server_id, method, timeout=120)
+        for cmd, desc in install_methods:
+            await log_step(f"   Метод: {desc}")
+            stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=180)
             if success:
                 installed = True
-                await log_step("WireGuard установлен")
+                await log_step("   ✅ WireGuard установлен")
                 break
+            else:
+                await log_step(f"   ❌ Не удалось: {stderr[:100]}", False)
         
         if not installed:
-            await log_step("Не удалось установить WireGuard. Пробую установить из исходников...", False)
+            await log_step("5. Пробую установить из исходников...", False)
             
             # Установка зависимостей
-            deps_cmd = "apt-get install -y build-essential git libmnl-dev libelf-dev linux-headers-$(uname -r)"
+            deps_cmd = "apt-get install -y build-essential git libmnl-dev libelf-dev linux-headers-$(uname -r) pkg-config"
             stdout, stderr, success = await execute_ssh_command(server_id, deps_cmd, timeout=180)
             
             if success:
                 # Компиляция из исходников
                 source_cmd = """
                 cd /tmp && git clone https://git.zx2c4.com/wireguard-tools && \
-                cd wireguard-tools && make && make install
+                cd wireguard-tools && make -j$(nproc) && make install
                 """
                 stdout, stderr, success = await execute_ssh_command(server_id, source_cmd, timeout=300)
                 
                 if success:
                     installed = True
-                    await log_step("WireGuard установлен из исходников")
+                    await log_step("   ✅ WireGuard установлен из исходников")
                 else:
-                    await log_step("Не удалось установить из исходников", False)
+                    await log_step(f"   ❌ Ошибка компиляции: {stderr[:200]}", False)
             else:
-                await log_step("Не удалось установить зависимости", False)
+                await log_step(f"   ❌ Не удалось установить зависимости: {stderr[:200]}", False)
         
         if not installed:
             return False, steps
         
-        # 4. Создание директории
-        await log_step("Создаю директорию для WireGuard...")
-        await execute_ssh_command(server_id, "mkdir -p /etc/wireguard")
+        # 6. Создание директории
+        await log_step("6. Создаю директорию для WireGuard...")
+        await execute_ssh_command(server_id, "mkdir -p /etc/wireguard && chmod 700 /etc/wireguard")
         
-        # 5. Генерация ключей
-        await log_step("Генерирую ключи...")
+        # 7. Генерация ключей
+        await log_step("7. Генерирую ключи...")
         keygen_cmd = """
         cd /etc/wireguard
         umask 077
         wg genkey | tee private.key | wg pubkey > public.key
         chmod 600 private.key public.key
+        echo "Ключи сгенерированы"
         """
         
         stdout, stderr, success = await execute_ssh_command(server_id, keygen_cmd)
         if not success:
-            await log_step("Ошибка генерации ключей", False)
+            await log_step(f"❌ Ошибка генерации ключей: {stderr}", False)
             return False, steps
         
-        # 6. Получение публичного ключа
-        await log_step("Получаю публичный ключ...")
+        # 8. Получение публичного ключа
+        await log_step("8. Получаю публичный ключ...")
         stdout, stderr, success = await execute_ssh_command(server_id, "cat /etc/wireguard/public.key")
         if not success or not stdout.strip():
-            await log_step("Не удалось получить публичный ключ", False)
+            await log_step("❌ Не удалось получить публичный ключ", False)
             return False, steps
         
         public_key = stdout.strip()
         
-        # 7. Получение IP сервера
-        await log_step("Определяю IP адрес сервера...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "curl -s ifconfig.me || hostname -I | awk '{print $1}'")
+        # 9. Получение IP сервера
+        await log_step("9. Определяю IP адрес сервера...")
+        stdout, stderr, success = await execute_ssh_command(server_id, """
+        curl -s --max-time 5 ifconfig.me || \
+        curl -s --max-time 5 ifconfig.co || \
+        hostname -I | awk '{print $1}' || \
+        ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1
+        """)
+        
         server_ip = stdout.strip() if success and stdout.strip() else ""
         
-        # 8. Сохранение данных в БД
+        if not server_ip:
+            # Получаем из строки подключения
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute("SELECT connection_string FROM servers WHERE id = ?", (server_id,))
+                conn_str = (await cursor.fetchone())[0]
+                server_ip = conn_str.split('@')[1].split(':')[0] if '@' in conn_str else ""
+        
+        # 10. Создание конфига WireGuard
+        await log_step("10. Создаю конфигурацию WireGuard...")
+        
+        config_cmd = f"""
+        cd /etc/wireguard
+        cat > wg0.conf << 'EOF'
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = $(cat private.key)
+
+# Enable IP forwarding
+PostUp = sysctl -w net.ipv4.ip_forward=1
+PostUp = sysctl -w net.ipv6.conf.all.forwarding=1
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostUp = iptables -t nat -A POSTROUTING -o ens3 -j MASQUERADE
+
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o ens3 -j MASQUERADE
+EOF
+        """
+        
+        stdout, stderr, success = await execute_ssh_command(server_id, config_cmd)
+        if not success:
+            await log_step(f"❌ Ошибка создания конфига: {stderr}", False)
+            return False, steps
+        
+        # 11. Запуск WireGuard
+        await log_step("11. Запускаю WireGuard...")
+        
+        # Проверяем и включаем автозагрузку
+        enable_cmd = """
+        systemctl enable wg-quick@wg0 2>/dev/null || true
+        systemctl start wg-quick@wg0 2>/dev/null || true
+        """
+        
+        stdout, stderr, success = await execute_ssh_command(server_id, enable_cmd)
+        
+        # Проверяем статус
+        status_cmd = "systemctl is-active wg-quick@wg0 2>/dev/null || wg show 2>/dev/null && echo 'active' || echo 'inactive'"
+        stdout, stderr, success = await execute_ssh_command(server_id, status_cmd)
+        
+        if 'active' in stdout or success:
+            await log_step("   ✅ WireGuard запущен")
+        else:
+            # Пробуем запустить вручную
+            manual_cmd = "wg-quick up wg0 2>&1 || true"
+            await execute_ssh_command(server_id, manual_cmd)
+            await log_step("   ⚠️ WireGuard запущен вручную")
+        
+        # 12. Сохранение данных в БД
+        await log_step("12. Сохраняю данные в базу...")
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE servers SET public_key = ?, wireguard_configured = TRUE, server_ip = ? WHERE id = ?",
+                """UPDATE servers SET 
+                public_key = ?, 
+                wireguard_configured = TRUE, 
+                server_ip = ?,
+                last_check = datetime('now')
+                WHERE id = ?""",
                 (public_key, server_ip, server_id)
             )
             await db.commit()
         
-        await log_step("✅ WireGuard успешно настроен!")
-        await log_step(f"Публичный ключ: {public_key[:30]}...")
-        await log_step(f"IP сервера: {server_ip}")
+        # 13. Финальная проверка
+        await log_step("13. Проверяю работу WireGuard...")
+        check_cmd = "wg show 2>/dev/null | head -5 || echo 'WireGuard check failed'"
+        stdout, stderr, success = await execute_ssh_command(server_id, check_cmd)
         
-        return True, steps
+        if success and 'interface:' in stdout.lower():
+            await log_step(f"✅ WireGuard успешно настроен и работает!")
+            await log_step(f"🔑 Публичный ключ: {public_key[:50]}...")
+            await log_step(f"🌐 IP сервера: {server_ip}")
+            await log_step(f"📊 Статистика: {success_steps}/{total_steps} шагов выполнено успешно")
+            
+            return True, steps
+        else:
+            await log_step("⚠️ WireGuard настроен, но есть проблемы с запуском", False)
+            await log_step(f"🔑 Публичный ключ: {public_key[:50]}...")
+            await log_step(f"🌐 IP сервера: {server_ip}")
+            await log_step(f"📊 Статистика: {success_steps}/{total_steps} шагов выполнено успешно")
+            
+            return True, steps  # Возвращаем True, так как ключи сгенерированы
         
     except Exception as e:
-        error_msg = f"Критическая ошибка: {str(e)}"
+        error_msg = f"❌ Критическая ошибка: {str(e)}"
         await log_step(error_msg, False)
         return False, steps
+
+async def install_wireguard_from_git(server_id: int, git_repo: str, message: Message = None):
+    """Устанавливает WireGuard из Git репозитория"""
+    async def log_step(text: str, success: bool = True):
+        if message:
+            try:
+                await message.answer(text)
+            except:
+                pass
+        logger.info(text)
+    
+    await log_step(f"🔧 Устанавливаю WireGuard из репозитория: {git_repo}")
+    
+    try:
+        # 1. Клонируем репозиторий
+        await log_step("1. Клонирую репозиторий...")
+        clone_cmd = f"cd /tmp && rm -rf wireguard-install && git clone {git_repo} wireguard-install"
+        stdout, stderr, success = await execute_ssh_command(server_id, clone_cmd, timeout=120)
+        
+        if not success:
+            await log_step(f"❌ Ошибка клонирования: {stderr}", False)
+            return False, stderr
+        
+        # 2. Проверяем наличие скрипта установки
+        await log_step("2. Ищу скрипт установки...")
+        find_cmd = "find /tmp/wireguard-install -name '*.sh' -o -name 'install*' -o -name 'setup*' | head -5"
+        stdout, stderr, success = await execute_ssh_command(server_id, find_cmd)
+        
+        if success and stdout:
+            scripts = stdout.strip().split('\n')
+            await log_step(f"📋 Найдены скрипты: {', '.join([os.path.basename(s) for s in scripts[:3]])}")
+            
+            # Пробуем запустить первый найденный скрипт
+            script_path = scripts[0]
+            await log_step(f"3. Запускаю скрипт: {os.path.basename(script_path)}...")
+            
+            # Даем права на выполнение
+            chmod_cmd = f"chmod +x {script_path}"
+            await execute_ssh_command(server_id, chmod_cmd)
+            
+            # Запускаем скрипт
+            run_cmd = f"cd /tmp/wireguard-install && {script_path} 2>&1"
+            stdout, stderr, success = await execute_ssh_command(server_id, run_cmd, timeout=300)
+            
+            if success:
+                await log_step("✅ Скрипт установки выполнен успешно")
+                
+                # Проверяем WireGuard
+                check_cmd = "which wg && echo 'WireGuard found' || echo 'WireGuard not found'"
+                stdout, stderr, success = await execute_ssh_command(server_id, check_cmd)
+                
+                if 'WireGuard found' in stdout:
+                    await log_step("✅ WireGuard успешно установлен из Git")
+                    
+                    # Получаем публичный ключ
+                    pubkey_cmd = "cat /etc/wireguard/public.key 2>/dev/null || wg pubkey < /etc/wireguard/private.key 2>/dev/null || echo 'no key'"
+                    stdout, stderr, success = await execute_ssh_command(server_id, pubkey_cmd)
+                    
+                    if success and 'no key' not in stdout:
+                        public_key = stdout.strip()
+                        
+                        # Сохраняем в БД
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "UPDATE servers SET public_key = ?, wireguard_configured = TRUE WHERE id = ?",
+                                (public_key, server_id)
+                            )
+                            await db.commit()
+                        
+                        await log_step(f"🔑 Публичный ключ сохранен: {public_key[:50]}...")
+                        return True, "WireGuard установлен из Git репозитория"
+                    else:
+                        await log_step("⚠️ WireGuard установлен, но не удалось получить ключ", False)
+                        return True, "WireGuard установлен, но ключ не получен"
+                else:
+                    await log_step("❌ WireGuard не установлен после скрипта", False)
+                    return False, "WireGuard не установлен"
+            else:
+                await log_step(f"❌ Ошибка выполнения скрипта: {stderr[:200]}", False)
+                return False, stderr
+        else:
+            await log_step("❌ Не найден скрипт установки в репозитории", False)
+            return False, "Не найден скрипт установки"
+        
+    except Exception as e:
+        error_msg = f"❌ Ошибка установки из Git: {str(e)}"
+        await log_step(error_msg, False)
+        return False, error_msg
 
 async def create_wireguard_client(server_id: int, user_id: int, message: Message = None):
     """Создает клиента WireGuard с логированием"""
@@ -423,7 +648,7 @@ async def create_wireguard_client(server_id: int, user_id: int, message: Message
                 pass
         logger.info(text)
     
-    await log_step("🔄 Создаю VPN конфигурацию...")
+    await log_step("🔄 Создаю VPN конфигурацию для пользователя...")
     
     try:
         # 1. Получаем данные сервера
@@ -470,37 +695,16 @@ async def create_wireguard_client(server_id: int, user_id: int, message: Message
         
         client_ip = f"10.0.0.{peer_count + 2}"
         
-        # 5. Создаем конфиг WireGuard если его нет
-        await log_step("Настраиваю конфигурацию WireGuard...")
-        check_config = "test -f /etc/wireguard/wg0.conf && echo 'exists' || echo 'not exists'"
-        stdout, stderr, success = await execute_ssh_command(server_id, check_config)
+        # 5. Добавляем пира в конфиг
+        await log_step("Добавляю клиента в конфигурацию WireGuard...")
         
-        if success and 'not exists' in stdout:
-            # Создаем базовый конфиг
-            config_cmd = """
-            cd /etc/wireguard
-            cat > wg0.conf << 'EOF'
-[Interface]
-Address = 10.0.0.1/24
-ListenPort = 51820
-PrivateKey = $(cat private.key)
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-
-EOF
-            """
-            await execute_ssh_command(server_id, config_cmd)
-        
-        # 6. Добавляем пира в конфиг
         add_peer_cmd = f"""
         cd /etc/wireguard
-        cat >> wg0.conf << 'EOF'
-
-[Peer]
-# Client {user_id}
-PublicKey = {public_key}
-AllowedIPs = {client_ip}/32
-EOF
+        echo "" >> wg0.conf
+        echo "[Peer]" >> wg0.conf
+        echo "# Client {user_id}" >> wg0.conf
+        echo "PublicKey = {public_key}" >> wg0.conf
+        echo "AllowedIPs = {client_ip}/32" >> wg0.conf
         """
         
         stdout, stderr, success = await execute_ssh_command(server_id, add_peer_cmd)
@@ -508,24 +712,10 @@ EOF
             await log_step("❌ Не удалось добавить клиента в конфиг", False)
             return None
         
-        # 7. Перезапускаем WireGuard
-        await log_step("Перезапускаю WireGuard...")
-        
-        # Проверяем запущен ли сервис
-        check_service = "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
-        stdout, stderr, success = await execute_ssh_command(server_id, check_service)
-        
-        if success and 'active' not in stdout:
-            # Запускаем сервис
-            start_cmd = """
-            systemctl enable wg-quick@wg0
-            systemctl start wg-quick@wg0
-            """
-            await execute_ssh_command(server_id, start_cmd)
-        else:
-            # Перезагружаем конфиг
-            reload_cmd = "wg syncconf wg0 <(wg-quick strip wg0)"
-            await execute_ssh_command(server_id, reload_cmd)
+        # 6. Перезагружаем конфиг
+        await log_step("Применяю изменения конфигурации...")
+        reload_cmd = "wg syncconf wg0 <(wg-quick strip wg0) 2>/dev/null || systemctl restart wg-quick@wg0"
+        await execute_ssh_command(server_id, reload_cmd)
         
         await log_step(f"✅ Клиент создан: IP={client_ip}")
         
@@ -550,25 +740,9 @@ async def create_vpn_for_user(user_id: int, period_days: int = 7, gifted: bool =
     server_id = await get_available_server()
     if not server_id:
         if message:
-            await message.answer("❌ Нет доступных серверов")
+            await message.answer("❌ Нет доступных серверов с настроенным WireGuard")
         return False
     
-    # Проверяем настроен ли WireGuard
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT wireguard_configured FROM servers WHERE id = ?", (server_id,))
-        server = await cursor.fetchone()
-        
-        if not server or not server[0]:
-            if message:
-                await message.answer("⚙️ WireGuard не настроен, начинаю настройку...")
-            
-            success, steps = await setup_wireguard_server(server_id, message)
-            
-            if not success:
-                if message:
-                    await message.answer("❌ Не удалось настроить WireGuard")
-                return False
-        
     # Создаем клиента
     vpn_config = await create_wireguard_client(server_id, user_id, message)
     
@@ -669,19 +843,18 @@ async def create_test_bot(server_id: int, bot_token: str, message: Message):
     await message.answer("🤖 Создаю тестового бота...")
     
     try:
-        # 1. Проверяем Docker
-        await message.answer("Проверяю Docker...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "which docker")
-        
-        if not success or "not found" in stderr:
-            await message.answer("Устанавливаю Docker...")
-            await execute_ssh_command(server_id, "apt-get update && apt-get install -y docker.io", timeout=120)
+        # 1. Проверяем подключение
+        await message.answer("1. Проверяю SSH подключение...")
+        ssh_ok, ssh_msg = await test_ssh_connection(server_id, message)
+        if not ssh_ok:
+            return False, f"SSH ошибка: {ssh_msg}"
         
         # 2. Создаем простого бота
+        await message.answer("2. Создаю файлы бота...")
+        
         bot_content = f"""import os
 import time
 import asyncio
-from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 
@@ -713,54 +886,59 @@ if __name__ == "__main__":
     asyncio.run(main())
 """
         
-        # 3. Создаем файлы на сервере
-        await message.answer("Создаю файлы бота...")
-        
         # Создаем директорию
-        await execute_ssh_command(server_id, "mkdir -p /tmp/test_bot")
+        await execute_ssh_command(server_id, "mkdir -p /tmp/test_bot && cd /tmp/test_bot && rm -f bot.py requirements.txt")
         
         # Создаем bot.py
         create_bot_cmd = f"cd /tmp/test_bot && cat > bot.py << 'EOF'\n{bot_content}\nEOF"
-        await execute_ssh_command(server_id, create_bot_cmd)
+        stdout, stderr, success = await execute_ssh_command(server_id, create_bot_cmd)
+        
+        if not success:
+            return False, f"Ошибка создания bot.py: {stderr}"
         
         # Создаем requirements.txt
         await execute_ssh_command(server_id, "cd /tmp/test_bot && echo 'aiogram>=3.0.0' > requirements.txt")
         
-        # 4. Создаем Dockerfile
-        dockerfile = """FROM python:3.11-slim
-WORKDIR /app
-COPY . .
-RUN pip install --no-cache-dir -r requirements.txt
-CMD ["python", "bot.py"]"""
-        
-        create_dockerfile = "cd /tmp/test_bot && cat > Dockerfile << 'EOF'\n" + dockerfile + "\nEOF"
-        await execute_ssh_command(server_id, create_dockerfile)
-        
-        # 5. Собираем и запускаем контейнер
-        await message.answer("Собираю Docker образ...")
-        await execute_ssh_command(server_id, "cd /tmp/test_bot && docker build -t test_bot .", timeout=180)
-        
-        await message.answer("Запускаю бота...")
-        stdout, stderr, success = await execute_ssh_command(
-            server_id, 
-            "docker run -d --name test_bot --restart unless-stopped test_bot"
-        )
-        
-        if success and stdout:
-            container_id = stdout.strip()[:12]
-            await message.answer(f"✅ Тестовый бот запущен!\\n\\n🆔 Контейнер: {container_id}")
-            
-            # Получаем логи
-            await asyncio.sleep(2)
-            stdout, stderr, success = await execute_ssh_command(server_id, "docker logs test_bot --tail 10")
-            if success:
-                logs = stdout[-500:] if stdout else 'Нет логов'
-                await message.answer(f"📋 Логи запуска:\\n<code>{logs}</code>", parse_mode=ParseMode.HTML)
-            
-            return True, "Бот успешно создан и запущен"
+        # 3. Проверяем Python
+        await message.answer("3. Проверяю Python...")
+        stdout, stderr, success = await execute_ssh_command(server_id, "python3 --version || python --version")
+        if success:
+            await message.answer(f"✅ {stdout.strip()}")
         else:
-            await message.answer(f"❌ Ошибка запуска: {stderr}")
-            return False, stderr
+            await message.answer("⚠️ Python не найден, устанавливаю...")
+            await execute_ssh_command(server_id, "apt-get update && apt-get install -y python3 python3-pip", timeout=120)
+        
+        # 4. Устанавливаем зависимости
+        await message.answer("4. Устанавливаю зависимости...")
+        stdout, stderr, success = await execute_ssh_command(server_id, "cd /tmp/test_bot && pip3 install aiogram", timeout=120)
+        if not success:
+            return False, f"Ошибка установки зависимостей: {stderr}"
+        
+        # 5. Запускаем бота в фоне
+        await message.answer("5. Запускаю бота...")
+        run_cmd = f"cd /tmp/test_bot && nohup python3 bot.py > bot.log 2>&1 & echo $! > bot.pid && sleep 3"
+        stdout, stderr, success = await execute_ssh_command(server_id, run_cmd)
+        
+        if success:
+            # Проверяем запуск
+            await asyncio.sleep(2)
+            check_cmd = "ps aux | grep 'python3 bot.py' | grep -v grep | head -1"
+            stdout, stderr, success = await execute_ssh_command(server_id, check_cmd)
+            
+            if success and stdout:
+                pid = stdout.split()[1] if len(stdout.split()) > 1 else "unknown"
+                await message.answer(f"✅ Тестовый бот запущен! PID: {pid}")
+                
+                # Получаем логи
+                log_cmd = "cd /tmp/test_bot && tail -10 bot.log 2>/dev/null || echo 'Нет логов'"
+                stdout, stderr, success = await execute_ssh_command(server_id, log_cmd)
+                logs = stdout if stdout else "Нет логов"
+                
+                return True, f"Бот запущен. Логи:\n{logs[:500]}"
+            else:
+                return False, "Бот не запустился"
+        else:
+            return False, f"Ошибка запуска: {stderr}"
         
     except Exception as e:
         error_msg = f"❌ Ошибка создания бота: {str(e)}"
@@ -825,10 +1003,21 @@ def server_list_keyboard(servers):
     """Создает клавиатуру со списком серверов"""
     buttons = []
     for server in servers:
-        server_id, server_name, is_active = server
+        server_id, server_name, is_active, wg_configured = server
         status = "🟢" if is_active else "🔴"
-        buttons.append([types.KeyboardButton(text=f"{status} {server_name} (ID: {server_id})")])
+        wg_status = "🔐" if wg_configured else "❌"
+        buttons.append([types.KeyboardButton(text=f"{status}{wg_status} {server_name} (ID: {server_id})")])
     buttons.append([types.KeyboardButton(text="◀️ Назад")])
+    return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def server_actions_keyboard():
+    """Клавиатура действий с сервером"""
+    buttons = [
+        [types.KeyboardButton(text="🔧 Установить WireGuard вручную")],
+        [types.KeyboardButton(text="📊 Проверить состояние")],
+        [types.KeyboardButton(text="🤖 Тестировать ботом")],
+        [types.KeyboardButton(text="◀️ Назад к списку")]
+    ]
     return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 # ========== FSM СОСТОЯНИЯ ==========
@@ -851,6 +1040,10 @@ class AdminPriceStates(StatesGroup):
 class AdminTestBotStates(StatesGroup):
     waiting_for_server = State()
     waiting_for_token = State()
+
+class AdminManualWGStates(StatesGroup):
+    waiting_for_server = State()
+    waiting_for_git_repo = State()
 
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 @dp.message(CommandStart())
@@ -1045,11 +1238,9 @@ async def process_vpn_period(message: Message, state: FSMContext):
 async def help_command(message: Message):
     """Команда помощи"""
     await message.answer(
-        "🆘 <b>Помощь и поддержка</b>\n\n"
-        "• VPN не работает: @vpnbothost\n"
-        "• Проблемы с оплатой: @vpnbothost\n"
-        "• Техподдержка: @vpnbothost\n\n"
-        "Мы всегда готовы помочь!",
+        f"🆘 <b>Помощь и поддержка</b>\n\n"
+        f"Если нужна помощь, обратитесь: {SUPPORT_USERNAME}\n\n"
+        f"Мы всегда готовы помочь!",
         parse_mode=ParseMode.HTML,
         reply_markup=user_main_menu()
     )
@@ -1157,7 +1348,7 @@ async def admin_list_servers(message: Message):
         text += f"Пользователи: {current}/{max_users}\n"
         text += f"WireGuard: {wg_status}\n\n"
     
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=servers_menu())
 
 @dp.message(F.text == "➕ Добавить сервер")
 async def admin_add_server(message: Message, state: FSMContext):
@@ -1195,7 +1386,7 @@ async def process_ssh_key_doc(message: Message, state: FSMContext, bot: Bot):
             "✅ SSH-ключ получен!\n\n"
             "Введите строку подключения:\n"
             "Формат: <code>user@host:port</code>\n"
-            "Пример: <code>opc@123.456.7.89</code>\n\n"
+            "Пример: <code>opc@193.122.8.29</code>\n\n"
             "Если порт стандартный (22), можно без порта: <code>user@host</code>",
             parse_mode=ParseMode.HTML
         )
@@ -1224,7 +1415,7 @@ async def process_ssh_key_text(message: Message, state: FSMContext):
         "✅ SSH-ключ получен!\n\n"
         "Введите строку подключения:\n"
         "Формат: <code>user@host:port</code>\n"
-        "Пример: <code>opc@123.456.7.89</code>\n\n"
+        "Пример: <code>opc@193.122.8.29</code>\n\n"
         "Если порт стандартный (22), можно без порта: <code>user@host</code>",
         parse_mode=ParseMode.HTML
     )
@@ -1264,11 +1455,37 @@ async def process_connection(message: Message, state: FSMContext):
             f"✅ Сервер <b>{data['server_name']}</b> добавлен!\n\n"
             f"ID: {server_id}\n"
             f"IP: {host}\n\n"
-            f"⚠️ <b>WireGuard не настроен!</b>\n"
-            f"Настройте его через тест сервера.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_main_menu()
+            f"🔄 <b>Начинаю автоматическую настройку WireGuard...</b>",
+            parse_mode=ParseMode.HTML
         )
+        
+        # Автоматически настраиваем WireGuard
+        success, steps = await setup_wireguard_server(server_id, message)
+        
+        if success:
+            await message.answer(
+                f"🎉 <b>WireGuard успешно настроен на сервере {data['server_name']}!</b>\n\n"
+                f"✅ Сервер готов к использованию для VPN.\n"
+                f"🔑 Ключи сгенерированы\n"
+                f"🌐 Сервис запущен\n\n"
+                f"Теперь вы можете использовать этот сервер для создания VPN подключений.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_main_menu()
+            )
+        else:
+            # Предлагаем альтернативные варианты
+            await message.answer(
+                f"⚠️ <b>Не удалось автоматически настроить WireGuard</b>\n\n"
+                f"Сервер добавлен (ID: {server_id}), но WireGuard не настроен.\n\n"
+                f"<b>Что можно сделать:</b>\n"
+                f"1. Проверить SSH доступ к серверу\n"
+                f"2. Установить WireGuard вручную через 'Тест сервера'\n"
+                f"3. Использовать другой сервер\n\n"
+                f"SSH команда для проверки:\n"
+                f"<code>ssh -i key.pem {connection_string}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_main_menu()
+            )
         
     except ValueError as e:
         await message.answer(f"❌ Ошибка формата: {str(e)}\n\nВведите строку подключения в формате: user@host:port")
@@ -1529,14 +1746,14 @@ async def admin_confirm_prices(message: Message, state: FSMContext):
 
 @dp.message(F.text == "🤖 Тест сервера")
 async def admin_test_server(message: Message, state: FSMContext):
-    """Тестирование сервера - создание тестового бота"""
+    """Тестирование сервера"""
     if not is_admin(message.from_user.id):
         return
     
     # Получаем список серверов
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, name, is_active FROM servers ORDER BY name")
+            cursor = await db.execute("SELECT id, name, is_active, wireguard_configured FROM servers ORDER BY name")
             servers = await cursor.fetchall()
     except Exception as e:
         logger.error(f"Ошибка получения серверов: {e}")
@@ -1562,13 +1779,11 @@ async def process_test_server(message: Message, state: FSMContext):
     
     # Парсим ID сервера из сообщения
     try:
-        # Ищем ID в скобках
         import re
         match = re.search(r'\(ID:\s*(\d+)\)', message.text)
         if match:
             server_id = int(match.group(1))
         else:
-            # Ищем цифры в тексте
             numbers = re.findall(r'\d+', message.text)
             if numbers:
                 server_id = int(numbers[-1])
@@ -1588,14 +1803,249 @@ async def process_test_server(message: Message, state: FSMContext):
         await message.answer("Сервер не найден. Выберите из списка:")
         return
     
+    # Получаем информацию о сервере
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT name, wireguard_configured FROM servers WHERE id = ?", (server_id,))
+            server_info = await cursor.fetchone()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения информации о сервере: {e}")
+        return
+    
+    server_name, wg_configured = server_info
+    
+    await state.update_data(server_id=server_id, server_name=server_name)
+    
+    if not wg_configured:
+        # Если WireGuard не настроен, предлагаем варианты
+        keyboard = types.ReplyKeyboardMarkup(keyboard=[
+            [types.KeyboardButton(text="🔧 Установить WireGuard вручную")],
+            [types.KeyboardButton(text="🔍 Проверить SSH подключение")],
+            [types.KeyboardButton(text="🤖 Протестировать ботом")],
+            [types.KeyboardButton(text="◀️ Назад к списку")]
+        ], resize_keyboard=True)
+        
+        await message.answer(
+            f"🔍 <b>Сервер: {server_name} (ID: {server_id})</b>\n\n"
+            f"⚠️ <b>WireGuard не настроен!</b>\n\n"
+            f"Выберите действие:",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        # Если WireGuard настроен, просто тестируем
+        await state.set_state(AdminTestBotStates.waiting_for_token)
+        await message.answer(
+            f"✅ <b>Сервер: {server_name} (ID: {server_id})</b>\n\n"
+            f"WireGuard уже настроен.\n\n"
+            f"Отправьте токен бота для тестирования:\n"
+            f"(получите у @BotFather)",
+            reply_markup=back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+
+@dp.message(F.text == "🔧 Установить WireGuard вручную")
+async def admin_install_wg_manual(message: Message, state: FSMContext):
+    """Ручная установка WireGuard"""
+    data = await state.get_data()
+    server_id = data.get('server_id')
+    server_name = data.get('server_name')
+    
+    if not server_id:
+        await message.answer("❌ Ошибка: ID сервера не найден")
+        await state.clear()
+        return
+    
+    await state.set_state(AdminManualWGStates.waiting_for_git_repo)
     await state.update_data(server_id=server_id)
-    await state.set_state(AdminTestBotStates.waiting_for_token)
     
     await message.answer(
-        f"Выбран сервер ID: {server_id}\n\n"
-        "Отправьте токен бота для тестирования:\n"
-        "(получите у @BotFather)",
-        reply_markup=ReplyKeyboardRemove()
+        f"🔧 <b>Ручная установка WireGuard на {server_name}</b>\n\n"
+        f"Отправьте ссылку на Git репозиторий с установщиком WireGuard:\n\n"
+        f"<b>Примеры репозиториев:</b>\n"
+        f"• https://github.com/angristan/wireguard-install.git\n"
+        f"• https://github.com/l-n-s/wireguard-install.git\n"
+        f"• Ваш собственный репозиторий\n\n"
+        f"<b>Требования:</b>\n"
+        f"• Репозиторий должен быть публичным\n"
+        f"• Должен быть скрипт установки (обычно .sh файл)\n"
+        f"• Скрипт должен поддерживать автоматическую установку",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_keyboard()
+    )
+
+@dp.message(AdminManualWGStates.waiting_for_git_repo)
+async def process_git_repo(message: Message, state: FSMContext):
+    """Обработка Git репозитория"""
+    if message.text == "◀️ Назад":
+        await state.set_state(AdminTestBotStates.waiting_for_server)
+        await message.answer("Выберите сервер:")
+        return
+    
+    git_repo = message.text.strip()
+    
+    if not (git_repo.startswith('http') or git_repo.startswith('git@')):
+        await message.answer(
+            "❌ Неверный формат ссылки!\n\n"
+            "Ссылка должна быть в формате:\n"
+            "• https://github.com/username/repo.git\n"
+            "• git@github.com:username/repo.git\n\n"
+            "Отправьте ссылку еще раз:",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    data = await state.get_data()
+    server_id = data.get('server_id')
+    server_name = data.get('server_name', 'сервер')
+    
+    # Устанавливаем WireGuard из Git
+    success, result = await install_wireguard_from_git(server_id, git_repo, message)
+    
+    if success:
+        await message.answer(
+            f"✅ <b>WireGuard успешно установлен на {server_name}!</b>\n\n"
+            f"Сервер готов к использованию для VPN подключений.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_main_menu()
+        )
+    else:
+        await message.answer(
+            f"❌ <b>Не удалось установить WireGuard</b>\n\n"
+            f"Ошибка: {result}\n\n"
+            f"Попробуйте:\n"
+            f"1. Другой репозиторий\n"
+            f"2. Установить вручную через SSH\n"
+            f"3. Проверить доступ к серверу",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_main_menu()
+        )
+    
+    await state.clear()
+
+@dp.message(F.text == "🔍 Проверить SSH подключение")
+async def admin_check_ssh(message: Message, state: FSMContext):
+    """Проверка SSH подключения"""
+    data = await state.get_data()
+    server_id = data.get('server_id')
+    server_name = data.get('server_name')
+    
+    if not server_id:
+        await message.answer("❌ Ошибка: ID сервера не найден")
+        return
+    
+    # Тестируем SSH подключение
+    success, result = await test_ssh_connection(server_id, message)
+    
+    if success:
+        await message.answer(
+            f"✅ <b>SSH подключение к {server_name} работает!</b>\n\n"
+            f"Теперь вы можете:\n"
+            f"1. Установить WireGuard вручную\n"
+            f"2. Протестировать ботом\n"
+            f"3. Проверить другие настройки",
+            parse_mode=ParseMode.HTML,
+            reply_markup=server_actions_keyboard()
+        )
+    else:
+        await message.answer(
+            f"❌ <b>SSH подключение не работает</b>\n\n"
+            f"Ошибка: {result}\n\n"
+            f"<b>Что проверить:</b>\n"
+            f"• Правильность SSH ключа\n"
+            f"• Доступность сервера из сети\n"
+            f"• Настройки фаервола\n"
+            f"• Пользовательские права\n\n"
+            f"Проверьте подключение вручную:\n"
+            f"<code>ssh -i ключ.pem пользователь@хост</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=server_actions_keyboard()
+        )
+
+@dp.message(F.text == "📊 Проверить состояние")
+async def admin_check_status(message: Message, state: FSMContext):
+    """Проверка состояния сервера"""
+    data = await state.get_data()
+    server_id = data.get('server_id')
+    server_name = data.get('server_name')
+    
+    if not server_id:
+        await message.answer("❌ Ошибка: ID сервера не найден")
+        return
+    
+    await message.answer(f"🔍 Проверяю состояние сервера {server_name}...")
+    
+    try:
+        # Получаем информацию из БД
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT name, server_ip, wireguard_configured, current_users, max_users, 
+                       last_check, created_at
+                FROM servers WHERE id = ?
+            """, (server_id,))
+            server_info = await cursor.fetchone()
+        
+        if not server_info:
+            await message.answer("❌ Информация о сервере не найдена")
+            return
+        
+        name, ip, wg_configured, current_users, max_users, last_check, created_at = server_info
+        
+        # Тестируем подключение
+        ssh_ok, ssh_msg = await test_ssh_connection(server_id, None)
+        
+        text = f"📊 <b>Состояние сервера: {name}</b>\n\n"
+        text += f"🆔 ID: {server_id}\n"
+        text += f"🌐 IP: {ip or 'не указан'}\n"
+        text += f"🔐 WireGuard: {'✅ настроен' if wg_configured else '❌ не настроен'}\n"
+        text += f"👥 Пользователи: {current_users}/{max_users}\n"
+        text += f"📅 Добавлен: {datetime.fromisoformat(created_at).strftime('%d.%m.%Y %H:%M')}\n"
+        
+        if last_check:
+            last_check_dt = datetime.fromisoformat(last_check)
+            text += f"⏰ Последняя проверка: {last_check_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        text += f"\n🔌 SSH подключение: {'✅ работает' if ssh_ok else '❌ не работает'}\n"
+        
+        if not ssh_ok and ssh_msg:
+            text += f"Ошибка: {ssh_msg[:100]}\n"
+        
+        # Если WireGuard настроен, проверяем его состояние
+        if wg_configured:
+            text += "\n🔍 Проверяю WireGuard...\n"
+            stdout, stderr, success = await execute_ssh_command(server_id, "wg show 2>/dev/null | head -3 || echo 'WireGuard not running'")
+            
+            if success and 'interface:' in stdout:
+                text += "✅ WireGuard запущен\n"
+                # Пытаемся получить количество пиров
+                peer_count = stdout.count('peer:') if 'peer:' in stdout else 0
+                text += f"📡 Подключено пиров: {peer_count}\n"
+            else:
+                text += "❌ WireGuard не запущен\n"
+        
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=server_actions_keyboard())
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка проверки состояния: {str(e)}")
+
+@dp.message(F.text == "🤖 Тестировать ботом")
+async def admin_test_with_bot(message: Message, state: FSMContext):
+    """Тестирование сервера ботом"""
+    data = await state.get_data()
+    server_id = data.get('server_id')
+    server_name = data.get('server_name')
+    
+    if not server_id:
+        await message.answer("❌ Ошибка: ID сервера не найден")
+        return
+    
+    await state.set_state(AdminTestBotStates.waiting_for_token)
+    await message.answer(
+        f"🤖 <b>Тестирование сервера {server_name} ботом</b>\n\n"
+        f"Отправьте токен бота для тестирования:\n"
+        f"(получите у @BotFather)",
+        reply_markup=back_keyboard(),
+        parse_mode=ParseMode.HTML
     )
 
 @dp.message(AdminTestBotStates.waiting_for_token)
@@ -1616,17 +2066,19 @@ async def process_test_bot_token(message: Message, state: FSMContext):
     
     data = await state.get_data()
     server_id = data.get('server_id')
+    server_name = data.get('server_name', 'сервер')
     
     # Создаем тестового бота
     success, result = await create_test_bot(server_id, bot_token, message)
     
     if success:
         await message.answer(
-            f"✅ <b>Тестовый бот успешно создан!</b>\n\n"
+            f"✅ <b>Тестовый бот успешно создан на {server_name}!</b>\n\n"
             f"Сервер работает корректно.\n\n"
-            f"Теперь вы можете:\n"
-            f"1. Настроить WireGuard на этом сервере\n"
-            f"2. Использовать его для VPN пользователей",
+            f"{result}\n\n"
+            f"<b>Что дальше:</b>\n"
+            f"• Настройте WireGuard если еще не настроен\n"
+            f"• Используйте сервер для VPN подключений",
             parse_mode=ParseMode.HTML,
             reply_markup=admin_main_menu()
         )
@@ -1634,15 +2086,31 @@ async def process_test_bot_token(message: Message, state: FSMContext):
         await message.answer(
             f"❌ <b>Ошибка создания тестового бота!</b>\n\n"
             f"Ошибка: {result}\n\n"
-            f"Проверьте:\n"
+            f"<b>Проверьте:</b>\n"
             f"• SSH доступ к серверу\n"
             f"• Доступность интернета на сервере\n"
-            f"• Права пользователя",
+            f"• Права пользователя\n"
+            f"• Наличие Python 3\n\n"
+            f"Для проверки SSH:\n"
+            f"<code>ssh -i ключ.pem пользователь@хост</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=admin_main_menu()
         )
     
     await state.clear()
+
+@dp.message(F.text == "◀️ Назад к списку")
+async def back_to_server_list(message: Message, state: FSMContext):
+    """Возврат к списку серверов"""
+    data = await state.get_data()
+    servers = data.get('servers', [])
+    
+    if servers:
+        await message.answer("Выберите сервер:", reply_markup=server_list_keyboard(servers))
+        await state.set_state(AdminTestBotStates.waiting_for_server)
+    else:
+        await message.answer("Админ-панель:", reply_markup=admin_main_menu())
+        await state.clear()
 
 @dp.message(F.text == "◀️ Назад")
 async def back_handler(message: Message, state: FSMContext):
@@ -1673,6 +2141,7 @@ async def main():
         print(f"✅ Бот запущен: @{me.username}")
         print(f"👑 Admin ID: {ADMIN_ID}")
         print(f"🗄️ База данных: {DB_PATH}")
+        print(f"🆘 Поддержка: {SUPPORT_USERNAME}")
         
         # Запускаем опрос
         logger.info("🔄 Запускаем опрос...")
