@@ -1,4 +1,4 @@
-# main.py - ПОЛНЫЙ КОД С ПРАВИЛЬНОЙ БАЗОЙ ДАННЫХ
+# main.py - ИСПРАВЛЕННЫЙ КОД
 import os
 import asyncio
 import logging
@@ -38,11 +38,14 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
-    """Инициализация базы данных"""
+    """Инициализация базы данных с проверкой существования"""
     logger.info(f"Инициализация БД по пути: {DB_PATH}")
     
     # Создаем папку /data если ее нет
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
+    # Проверяем, существует ли файл БД
+    db_exists = os.path.exists(DB_PATH)
     
     async with aiosqlite.connect(DB_PATH) as db:
         # Включаем поддержку внешних ключей
@@ -134,24 +137,33 @@ async def init_db():
             )
         """)
         
-        # Проверяем существуют ли уже настройки
+        # Инициализируем цены только если таблица пустая
         cursor = await db.execute("SELECT COUNT(*) FROM price_settings")
         count = await cursor.fetchone()
         
         if count[0] == 0:
-            # Инициализируем цены только если таблица пустая
+            # Инициализируем цены по умолчанию
             await db.execute(
-                "INSERT INTO price_settings (service_type, week_price, month_price) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO price_settings (service_type, week_price, month_price) VALUES (?, ?, ?)",
                 ("vpn", 50, 150)
             )
             await db.execute(
-                "INSERT INTO price_settings (service_type, week_price, month_price) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO price_settings (service_type, week_price, month_price) VALUES (?, ?, ?)",
                 ("bot", 100, 300)
             )
             logger.info("Инициализированы цены по умолчанию")
         
         await db.commit()
-        logger.info("База данных инициализирована успешно")
+        
+        if db_exists:
+            logger.info(f"База данных подключена (существующая)")
+        else:
+            logger.info(f"База данных создана и инициализирована")
+        
+        # Выводим список таблиц для отладки
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = await cursor.fetchall()
+        logger.info(f"Таблицы в БД: {[t[0] for t in tables]}")
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def is_admin(user_id: int, chat_id: int = None) -> bool:
@@ -312,18 +324,25 @@ async def execute_ssh_command(server_id: int, command: str) -> Tuple[str, str]:
 async def setup_wireguard_server(server_id: int) -> bool:
     """Настраивает WireGuard на сервере"""
     try:
+        logger.info(f"Настройка WireGuard на сервере {server_id}")
+        
         # Проверяем установлен ли WireGuard
         stdout, stderr = await execute_ssh_command(server_id, "which wg-quick")
         if "which:" in stderr or "not found" in stderr:
+            logger.info("Устанавливаем WireGuard...")
             await execute_ssh_command(server_id, "apt-get update && apt-get install -y wireguard")
         
-        # Настраиваем
-        commands = [
-            "sysctl -w net.ipv4.ip_forward=1",
-            "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf",
-            "mkdir -p /etc/wireguard",
-            "cd /etc/wireguard && umask 077 && wg genkey | tee server.private | wg pubkey > server.public",
-            """cat > /etc/wireguard/wg0.conf << 'EOF'
+        # Проверяем, настроен ли уже WireGuard
+        stdout, _ = await execute_ssh_command(server_id, "ls /etc/wireguard/server.public 2>/dev/null || echo 'not found'")
+        if "not found" in stdout:
+            # Настраиваем WireGuard
+            logger.info("Настраиваем WireGuard...")
+            commands = [
+                "sysctl -w net.ipv4.ip_forward=1",
+                "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf",
+                "mkdir -p /etc/wireguard",
+                "cd /etc/wireguard && umask 077 && wg genkey | tee server.private | wg pubkey > server.public",
+                """cat > /etc/wireguard/wg0.conf << 'EOF'
 [Interface]
 Address = 10.0.0.1/24
 ListenPort = 51820
@@ -331,12 +350,12 @@ PrivateKey = $(cat /etc/wireguard/server.private)
 PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 EOF""",
-            "wg-quick up wg0 2>/dev/null || true",
-            "systemctl enable wg-quick@wg0 2>/dev/null || true"
-        ]
-        
-        for cmd in commands:
-            await execute_ssh_command(server_id, cmd)
+                "wg-quick up wg0 2>/dev/null || true",
+                "systemctl enable wg-quick@wg0 2>/dev/null || true"
+            ]
+            
+            for cmd in commands:
+                await execute_ssh_command(server_id, cmd)
         
         # Получаем публичный ключ
         stdout, _ = await execute_ssh_command(server_id, "cat /etc/wireguard/server.public")
@@ -348,6 +367,7 @@ EOF""",
                     (public_key, server_id)
                 )
                 await db.commit()
+            logger.info(f"WireGuard настроен на сервере {server_id}")
             return True
         
     except Exception as e:
@@ -371,6 +391,7 @@ async def create_wireguard_client(server_id: int, user_id: int) -> Optional[Dict
         public_key = pub_stdout.strip() if pub_stdout else ""
         
         if not private_key or not public_key:
+            logger.error("Не удалось получить ключи клиента")
             return None
         
         # Получаем следующий IP
@@ -415,28 +436,27 @@ async def create_vpn_for_user(user_id: int, device_type: str, period_days: int) 
     """Создает VPN для пользователя"""
     server_id = await get_available_vpn_server()
     if not server_id:
+        logger.error("Нет доступных VPN серверов")
         return False
+    
+    logger.info(f"Создаем VPN для пользователя {user_id} на сервере {server_id}")
     
     # Настраиваем сервер если нужно
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT public_key FROM servers WHERE id = ?", (server_id,))
         server = await cursor.fetchone()
         
-        if not server[0]:  # Сервер не настроен
+        if not server or not server[0]:  # Сервер не настроен
+            logger.info(f"Сервер {server_id} не настроен, настраиваем...")
             if not await setup_wireguard_server(server_id):
+                logger.error(f"Не удалось настроить WireGuard на сервере {server_id}")
                 return False
     
-    vpn_config = None
-    
-    if device_type == "wireguard":
-        vpn_config = await create_wireguard_client(server_id, user_id)
-        config_type = "wireguard"
-    else:
-        # Для Android/iOS - используем WireGuard
-        vpn_config = await create_wireguard_client(server_id, user_id)
-        config_type = "wireguard"
+    vpn_config = await create_wireguard_client(server_id, user_id)
+    config_type = "wireguard"
     
     if not vpn_config:
+        logger.error(f"Не удалось создать конфиг для пользователя {user_id}")
         return False
     
     # Сохраняем пользователя
@@ -516,6 +536,7 @@ async def create_bot_for_user(user_id: int, period_days: int) -> bool:
     """Создает бота для пользователя"""
     server_id = await get_available_bot_server()
     if not server_id:
+        logger.error("Нет доступных серверов для ботов")
         return False
     
     # Генерируем имя бота
@@ -526,15 +547,45 @@ async def create_bot_for_user(user_id: int, period_days: int) -> bool:
         # Устанавливаем Docker если нужно
         stdout, stderr = await execute_ssh_command(server_id, "which docker")
         if "which:" in stderr or "not found" in stderr:
+            logger.info("Устанавливаем Docker...")
             await execute_ssh_command(server_id, "apt-get update && apt-get install -y docker.io")
         
-        # Создаем контейнер с Python ботом
-        container_cmd = f"""docker run -d \
---name {bot_name} \
---restart unless-stopped \
--e BOT_TOKEN=YOUR_TOKEN_HERE \
-python:3.11-slim sh -c "pip install aiogram && python -c 'print(\"Bot container ready\")' && sleep infinity"
-"""
+        # Создаем простой Python файл с ботом
+        bot_code = '''import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
+
+bot = Bot(token="YOUR_BOT_TOKEN")
+dp = Dispatcher()
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    await message.answer("Hello! This is your hosted bot.")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+        
+        # Создаем Dockerfile
+        dockerfile = f'''FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bot.py .
+CMD ["python", "bot.py"]
+'''
+        
+        # Создаем файлы на сервере
+        await execute_ssh_command(server_id, f"mkdir -p /tmp/{bot_name}")
+        await execute_ssh_command(server_id, f"echo 'aiogram>=3.0.0' > /tmp/{bot_name}/requirements.txt")
+        await execute_ssh_command(server_id, f"echo '{bot_code}' > /tmp/{bot_name}/bot.py")
+        await execute_ssh_command(server_id, f"echo '{dockerfile}' > /tmp/{bot_name}/Dockerfile")
+        
+        # Создаем контейнер
+        container_cmd = f"""cd /tmp/{bot_name} && docker build -t {bot_name} . && docker run -d --name {bot_name} --restart unless-stopped {bot_name}"""
         
         await execute_ssh_command(server_id, container_cmd)
         
@@ -554,6 +605,8 @@ python:3.11-slim sh -c "pip install aiogram && python -c 'print(\"Bot container 
             )
             await db.commit()
         
+        end_date = datetime.now() + timedelta(days=period_days)
+        
         # Уведомляем пользователя
         try:
             await bot.send_message(
@@ -568,6 +621,7 @@ python:3.11-slim sh -c "pip install aiogram && python -c 'print(\"Bot container 
         except Exception as e:
             logger.error(f"Ошибка отправки уведомления: {e}")
         
+        logger.info(f"Бот создан для пользователя {user_id}")
         return True
         
     except Exception as e:
@@ -589,7 +643,8 @@ def admin_main_menu():
     buttons = [
         [types.KeyboardButton(text="🖥️ Серверы")],
         [types.KeyboardButton(text="👤 Пользователи")],
-        [types.KeyboardButton(text="💰 Управление ценами")]
+        [types.KeyboardButton(text="💰 Управление ценами")],
+        [types.KeyboardButton(text="🤖 Создать тестового бота")]
     ]
     return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -823,27 +878,30 @@ async def process_vpn_period(message: Message, state: FSMContext):
         except:
             stars = 50 if period == "week" else 150
         
-        # Создаем инвойс для оплаты
-        payload = f"vpn:{message.from_user.id}:{period}:{int(datetime.now().timestamp())}"
+        # ИСПРАВЛЕНИЕ: Правильно формируем payload
+        timestamp = int(datetime.now().timestamp())
+        payload = f"vpn:{message.from_user.id}:{period}:{timestamp}"
+        
+        logger.info(f"Создаем инвойс: {stars} stars за VPN {period}")
         
         try:
             await bot.send_invoice(
                 chat_id=message.chat.id,
                 title=f"VPN на {days} дней",
-                description=f"Доступ к VPN серверам",
+                description=f"Доступ к VPN серверам на {days} дней",
                 payload=payload,
                 provider_token=PROVIDER_TOKEN,
                 currency="XTR",
-                prices=[LabeledPrice(label=f"VPN {days} дней", amount=stars * 100)],
+                prices=[LabeledPrice(label=f"VPN {days} дней", amount=stars)],
                 start_parameter="vpn_subscription"
             )
             
             try:
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
-                        """INSERT INTO payments (user_id, amount_stars, period, status)
-                        VALUES (?, ?, ?, 'pending')""",
-                        (message.from_user.id, stars, period)
+                        """INSERT INTO payments (user_id, amount_stars, period, status, invoice_payload)
+                        VALUES (?, ?, ?, 'pending', ?)""",
+                        (message.from_user.id, stars, period, payload)
                     )
                     await db.commit()
             except Exception as e:
@@ -980,26 +1038,29 @@ async def process_bot_period(message: Message, state: FSMContext):
         stars = 100 if period == "week" else 300
     
     # Создаем инвойс для оплаты
-    payload = f"bot:{message.from_user.id}:{period}:{int(datetime.now().timestamp())}"
+    timestamp = int(datetime.now().timestamp())
+    payload = f"bot:{message.from_user.id}:{period}:{timestamp}"
+    
+    logger.info(f"Создаем инвойс: {stars} stars за бота {period}")
     
     try:
         await bot.send_invoice(
             chat_id=message.chat.id,
             title=f"Бот на {days} дней",
-            description=f"Запуск Telegram бота в контейнере",
+            description=f"Запуск Telegram бота в контейнере на {days} дней",
             payload=payload,
             provider_token=PROVIDER_TOKEN,
             currency="XTR",
-            prices=[LabeledPrice(label=f"Бот {days} дней", amount=stars * 100)],
+            prices=[LabeledPrice(label=f"Бот {days} дней", amount=stars)],
             start_parameter="bot_hosting"
         )
         
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
-                    """INSERT INTO payments (user_id, amount_stars, period, status)
-                    VALUES (?, ?, ?, 'pending')""",
-                    (message.from_user.id, stars, period)
+                    """INSERT INTO payments (user_id, amount_stars, period, status, invoice_payload)
+                    VALUES (?, ?, ?, 'pending', ?)""",
+                    (message.from_user.id, stars, period, payload)
                 )
                 await db.commit()
         except Exception as e:
@@ -1051,8 +1112,8 @@ async def process_successful_payment(message: Message):
                 await db.execute(
                     """UPDATE payments 
                     SET status = 'completed', telegram_payment_id = ?
-                    WHERE user_id = ? AND period = ? AND status = 'pending'""",
-                    (payment.telegram_payment_charge_id, user_id, period)
+                    WHERE user_id = ? AND invoice_payload = ? AND status = 'pending'""",
+                    (payment.telegram_payment_charge_id, user_id, payment.invoice_payload)
                 )
                 await db.commit()
         except Exception as e:
@@ -1060,7 +1121,7 @@ async def process_successful_payment(message: Message):
         
         await message.answer(
             f"✅ <b>Оплата получена!</b>\n\n"
-            f"{payment.total_amount // 100} stars успешно списаны.\n"
+            f"{payment.total_amount} stars успешно списаны.\n"
             f"Сейчас активирую услугу...",
             parse_mode=ParseMode.HTML
         )
@@ -1077,10 +1138,8 @@ async def process_successful_payment(message: Message):
             state = FSMContext(storage=storage, key=user_id)
             
             await state.set_state(UserVPNStates.waiting_for_device)
-            await state.update_data(
-                period=period, 
-                days=30 if period == "month" else 7
-            )
+            days = 30 if period == "month" else 7
+            await state.update_data(period=period, days=days)
         
         elif service_type == "bot":
             # Для бота - сразу создаем
@@ -1116,6 +1175,83 @@ async def admin_servers(message: Message):
         reply_markup=servers_menu(),
         parse_mode=ParseMode.HTML
     )
+
+@dp.message(F.text == "🛡️ VPN серверы")
+async def admin_vpn_servers(message: Message):
+    """Список VPN серверов"""
+    if not is_admin(message.from_user.id, message.chat.id):
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT id, name, server_ip, current_users, max_users, 
+                       is_active, public_key, created_at
+                FROM servers 
+                WHERE server_type = 'vpn'
+                ORDER BY created_at DESC
+            """)
+            servers = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка получения списка VPN серверов: {e}")
+        await message.answer("❌ Ошибка получения данных")
+        return
+    
+    if not servers:
+        await message.answer("📭 VPN серверов нет")
+        return
+    
+    text = "🛡️ <b>VPN серверы:</b>\n\n"
+    
+    for server in servers:
+        id_, name, ip, current, max_users, active, pub_key, created = server
+        status = "🟢" if active else "🔴"
+        created_date = datetime.fromisoformat(created).strftime("%d.%m.%Y")
+        
+        text += f"{status} <b>{name}</b> (ID: {id_})\n"
+        text += f"IP: {ip or 'не указан'}\n"
+        text += f"Пользователи: {current}/{max_users}\n"
+        text += f"Ключ: {'✅' if pub_key else '❌'}\n"
+        text += f"Добавлен: {created_date}\n\n"
+    
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+@dp.message(F.text == "🤖 Серверы для ботов")
+async def admin_bot_servers(message: Message):
+    """Список серверов для ботов"""
+    if not is_admin(message.from_user.id, message.chat.id):
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT id, name, server_ip, is_active, created_at
+                FROM servers 
+                WHERE server_type = 'bot'
+                ORDER BY created_at DESC
+            """)
+            servers = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка получения списка серверов для ботов: {e}")
+        await message.answer("❌ Ошибка получения данных")
+        return
+    
+    if not servers:
+        await message.answer("🤖 Серверов для ботов нет")
+        return
+    
+    text = "🤖 <b>Серверы для ботов:</b>\n\n"
+    
+    for server in servers:
+        id_, name, ip, active, created = server
+        status = "🟢" if active else "🔴"
+        created_date = datetime.fromisoformat(created).strftime("%d.%m.%Y")
+        
+        text += f"{status} <b>{name}</b> (ID: {id_})\n"
+        text += f"IP: {ip or 'не указан'}\n"
+        text += f"Добавлен: {created_date}\n\n"
+    
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(F.text == "➕ Добавить сервер")
 async def admin_add_server(message: Message, state: FSMContext):
@@ -1155,30 +1291,73 @@ async def process_server_name(message: Message, state: FSMContext):
     """Обработка имени сервера"""
     await state.update_data(server_name=message.text)
     await state.set_state(AdminAddServerStates.waiting_for_key)
-    await message.answer("Отправьте файл с SSH-ключом:")
+    await message.answer("Отправьте файл с SSH-ключом (текстовый файл с приватным ключом):")
 
 @dp.message(AdminAddServerStates.waiting_for_key, F.document)
 async def process_ssh_key(message: Message, state: FSMContext, bot: Bot):
     """Обработка SSH ключа"""
-    file = await bot.get_file(message.document.file_id)
-    file_path = f"temp_{message.document.file_name}"
-    await bot.download_file(file.file_path, file_path)
-    
-    with open(file_path, 'r') as f:
-        ssh_key = f.read().strip()
-    
-    os.remove(file_path)
+    try:
+        file = await bot.get_file(message.document.file_id)
+        file_path = f"temp_{message.document.file_name}"
+        await bot.download_file(file.file_path, file_path)
+        
+        with open(file_path, 'r') as f:
+            ssh_key = f.read().strip()
+        
+        os.remove(file_path)
+        
+        # Проверяем формат ключа
+        if not ssh_key.startswith('-----BEGIN'):
+            # Пытаемся определить формат ключа
+            if "OPENSSH PRIVATE KEY" in ssh_key:
+                ssh_key = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh_key}\n-----END OPENSSH PRIVATE KEY-----"
+            elif "RSA PRIVATE KEY" in ssh_key:
+                ssh_key = f"-----BEGIN RSA PRIVATE KEY-----\n{ssh_key}\n-----END RSA PRIVATE KEY-----"
+            else:
+                # Предполагаем что это приватный ключ OpenSSH
+                ssh_key = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh_key}\n-----END OPENSSH PRIVATE KEY-----"
+        
+        await state.update_data(ssh_key=ssh_key)
+        await state.set_state(AdminAddServerStates.waiting_for_connection)
+        
+        await message.answer(
+            "✅ SSH-ключ получен!\n\n"
+            "Введите строку подключения:\n"
+            "Формат: <code>user@host:port</code>\n"
+            "Пример: <code>opc@123.456.7.89</code>\n\n"
+            "Если порт стандартный (22), можно без порта: <code>user@host</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка обработки SSH-ключа: {str(e)}")
+        logger.error(f"Ошибка обработки SSH-ключа: {e}")
+
+@dp.message(AdminAddServerStates.waiting_for_key)
+async def process_ssh_key_text(message: Message, state: FSMContext):
+    """Обработка SSH ключа отправленного текстом"""
+    ssh_key = message.text.strip()
     
     if not ssh_key.startswith('-----BEGIN'):
-        ssh_key = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh_key}\n-----END OPENSSH PRIVATE KEY-----"
+        # Пытаемся определить формат ключа
+        if "OPENSSH PRIVATE KEY" in ssh_key:
+            ssh_key = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh_key}\n-----END OPENSSH PRIVATE KEY-----"
+        elif "RSA PRIVATE KEY" in ssh_key:
+            ssh_key = f"-----BEGIN RSA PRIVATE KEY-----\n{ssh_key}\n-----END RSA PRIVATE KEY-----"
+        else:
+            # Предполагаем что это приватный ключ OpenSSH
+            ssh_key = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh_key}\n-----END OPENSSH PRIVATE KEY-----"
     
     await state.update_data(ssh_key=ssh_key)
     await state.set_state(AdminAddServerStates.waiting_for_connection)
     
     await message.answer(
+        "✅ SSH-ключ получен!\n\n"
         "Введите строку подключения:\n"
-        "Формат: user@host:port\n"
-        "Пример: opc@193.122.8.29",
+        "Формат: <code>user@host:port</code>\n"
+        "Пример: <code>opc@123.456.7.89</code>\n\n"
+        "Если порт стандартный (22), можно без порта: <code>user@host</code>",
+        parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove()
     )
 
@@ -1188,38 +1367,67 @@ async def process_connection(message: Message, state: FSMContext):
     data = await state.get_data()
     
     try:
-        if ':' in message.text:
-            user_host, port = message.text.rsplit(':', 1)
+        connection_string = message.text.strip()
+        
+        # Парсим строку подключения
+        if ':' in connection_string:
+            user_host, port = connection_string.rsplit(':', 1)
             user, host = user_host.split('@')
             port = int(port)
         else:
-            user, host = message.text.split('@')
+            user, host = connection_string.split('@')
             port = 22
-    except ValueError as e:
-        await message.answer(f"❌ Ошибка: {str(e)}")
-        return
-    
-    # Сохраняем сервер
-    try:
+        
+        # Проверяем подключение
+        await message.answer("🔄 Проверяю подключение к серверу...")
+        
+        # Сохраняем сервер
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 """INSERT INTO servers 
                 (name, ssh_key, connection_string, server_type, server_ip) 
                 VALUES (?, ?, ?, ?, ?)""",
-                (data['server_name'], data['ssh_key'], message.text, 
+                (data['server_name'], data['ssh_key'], connection_string, 
                  data['server_type'], host)
             )
             await db.commit()
+            
+            # Получаем ID добавленного сервера
+            cursor = await db.execute("SELECT last_insert_rowid()")
+            server_id = (await cursor.fetchone())[0]
+        
+        server_type_name = "VPN" if data['server_type'] == 'vpn' else "ботов"
+        
+        # Если это VPN сервер, настраиваем WireGuard
+        if data['server_type'] == 'vpn':
+            await message.answer(f"✅ Сервер для {server_type_name} добавлен! Настраиваю WireGuard...")
+            success = await setup_wireguard_server(server_id)
+            
+            if success:
+                await message.answer(
+                    f"✅ WireGuard успешно настроен на сервере <b>{data['server_name']}</b>!\n"
+                    f"Сервер готов к использованию.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await message.answer(
+                    f"⚠️ Сервер добавлен, но возникли проблемы с настройкой WireGuard.\n"
+                    f"Проверьте SSH доступ и попробуйте настроить вручную.",
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            await message.answer(
+                f"✅ Сервер для {server_type_name} <b>{data['server_name']}</b> добавлен!",
+                parse_mode=ParseMode.HTML
+            )
+        
+    except ValueError as e:
+        await message.answer(f"❌ Ошибка формата: {str(e)}\n\n"
+                           f"Введите строку подключения в формате: user@host:port")
+        return
     except Exception as e:
         await message.answer(f"❌ Ошибка сохранения: {str(e)}")
-        await state.clear()
-        return
-    
-    server_type_name = "VPN" if data['server_type'] == 'vpn' else "ботов"
-    await message.answer(
-        f"✅ Сервер для {server_type_name} <b>{data['server_name']}</b> добавлен!",
-        parse_mode=ParseMode.HTML
-    )
+        logger.error(f"Ошибка сохранения сервера: {e}")
     
     await state.clear()
     await message.answer("Админ-панель:", reply_markup=admin_main_menu())
@@ -1238,7 +1446,7 @@ async def admin_users(message: Message):
 
 @dp.message(F.text == "🎁 Выдать VPN")
 async def admin_give_vpn(message: Message, state: FSMContext):
-    """Выдача VPN от админа"""
+    """Выдача VPN от админа - ИСПРАВЛЕННЫЙ ВАРИАНТ"""
     if not is_admin(message.from_user.id, message.chat.id):
         return
     
@@ -1251,7 +1459,7 @@ async def admin_give_vpn(message: Message, state: FSMContext):
 
 @dp.message(F.text == "🤖 Выдать бота")
 async def admin_give_bot(message: Message, state: FSMContext):
-    """Выдача бота от админа"""
+    """Выдача бота от админа - ИСПРАВЛЕННЫЙ ВАРИАНТ"""
     if not is_admin(message.from_user.id, message.chat.id):
         return
     
@@ -1264,32 +1472,60 @@ async def admin_give_bot(message: Message, state: FSMContext):
 
 @dp.message(AdminUserStates.waiting_for_username)
 async def admin_process_username(message: Message, state: FSMContext):
-    """Обработка username от админа"""
+    """Обработка username от админа - ИСПРАВЛЕННЫЙ ВАРИАНТ"""
     username = message.text.strip()
     user_id = None
     
     if username.isdigit():
         user_id = int(username)
-        await state.update_data(user_id=user_id)
     elif username.startswith('@'):
-        # Сохраняем username
-        await state.update_data(username=username)
+        # Убираем @ для поиска в БД
+        username_clean = username[1:]
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT user_id FROM vpn_users WHERE username = ? LIMIT 1",
+                    (username_clean,)
+                )
+                result = await cursor.fetchone()
+                
+                if result:
+                    user_id = result[0]
+                else:
+                    await message.answer(
+                        f"Пользователь {username} не найден в базе данных.\n\n"
+                        f"Отправьте пользователю ссылку: https://t.me/{(await bot.get_me()).username}\n"
+                        f"Он должен написать боту, затем вы сможете выдать услугу.",
+                        reply_markup=admin_main_menu()
+                    )
+                    await state.clear()
+                    return
+        except Exception as e:
+            logger.error(f"Ошибка поиска пользователя: {e}")
+            await message.answer("❌ Ошибка поиска пользователя")
+            await state.clear()
+            return
     else:
         await message.answer("Введите @username или ID:")
         return
     
-    data = await state.get_data()
-    service = data.get('service', 'vpn')
-    
-    await state.set_state(AdminUserStates.waiting_for_period)
-    await message.answer(
-        f"Выберите период для {service}:",
-        reply_markup=admin_period_keyboard(service)
-    )
+    if user_id:
+        await state.update_data(user_id=user_id, username=username)
+        data = await state.get_data()
+        service = data.get('service', 'vpn')
+        
+        await state.set_state(AdminUserStates.waiting_for_period)
+        await message.answer(
+            f"Выберите период для {service}:",
+            reply_markup=admin_period_keyboard(service)
+        )
+    else:
+        await message.answer("Не удалось определить ID пользователя")
+        await state.clear()
 
 @dp.message(AdminUserStates.waiting_for_period)
 async def admin_process_period(message: Message, state: FSMContext):
-    """Обработка периода от админа"""
+    """Обработка периода от админа - ИСПРАВЛЕННЫЙ ВАРИАНТ"""
     if message.text == "◀️ Назад":
         await state.set_state(AdminUserStates.waiting_for_username)
         await message.answer("Введите @username или ID:")
@@ -1309,66 +1545,97 @@ async def admin_process_period(message: Message, state: FSMContext):
     data = await state.get_data()
     user_id = data.get('user_id')
     service = data.get('service', 'vpn')
-    username = data.get('username')
     
-    if not user_id and username:
-        # Нужно найти пользователя по username
-        await message.answer(
-            f"Пользователь {username} найден.\n"
-            f"Будет выдан {service} на {days} дней.\n\n"
-            f"Отправьте пользователю ссылку: https://t.me/{(await bot.get_me()).username}\n"
-            f"Он должен написать боту, затем вы сможете выдать услугу."
-        )
+    if not user_id:
+        await message.answer("❌ Ошибка: ID пользователя не найден")
         await state.clear()
-        await message.answer("Админ-панель:", reply_markup=admin_main_menu())
         return
     
-    # Создаем услугу
+    # Создаем услугу напрямую
     await message.answer(f"🔄 Выдаю {service} пользователю {user_id}...")
     
-    if service == "vpn":
-        # Для VPN отправляем пользователю сообщение
+    try:
+        if service == "vpn":
+            # Запрашиваем устройство
+            await message.answer(
+                f"✅ VPN будет выдан пользователю {user_id} на {days} дней.\n\n"
+                f"Выберите тип устройства для пользователя:",
+                reply_markup=vpn_device_keyboard()
+            )
+            await state.update_data(days=days)
+            await state.set_state(AdminUserStates.waiting_for_service)
+        
+        elif service == "bot":
+            # Создаем бота
+            success = await create_bot_for_user(user_id, days)
+            
+            if success:
+                await message.answer(
+                    f"✅ Бот успешно выдан пользователю {user_id} на {days} дней!",
+                    reply_markup=admin_main_menu()
+                )
+            else:
+                await message.answer(
+                    f"❌ Ошибка выдачи бота пользователю {user_id}",
+                    reply_markup=admin_main_menu()
+                )
+            await state.clear()
+    
+    except Exception as e:
+        logger.error(f"Ошибка выдачи услуги: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=admin_main_menu())
+        await state.clear()
+
+@dp.message(AdminUserStates.waiting_for_service)
+async def admin_process_service(message: Message, state: FSMContext):
+    """Обработка выбора устройства для админской выдачи VPN"""
+    if message.text == "◀️ Назад":
+        await state.set_state(AdminUserStates.waiting_for_period)
+        data = await state.get_data()
+        service = data.get('service', 'vpn')
+        await message.answer(f"Выберите период для {service}:", reply_markup=admin_period_keyboard(service))
+        return
+    
+    device_map = {
+        "📱 Android": "android",
+        "🍎 iOS": "ios",
+        "💻 WireGuard (рекомендуется)": "wireguard"
+    }
+    
+    if message.text not in device_map:
+        await message.answer("Выберите устройство из списка:")
+        return
+    
+    device_type = device_map[message.text]
+    data = await state.get_data()
+    user_id = data.get('user_id')
+    days = data.get('days', 7)
+    
+    # Создаем VPN
+    success = await create_vpn_for_user(user_id, device_type, days)
+    
+    if success:
+        # Отправляем уведомление пользователю
         try:
             await bot.send_message(
                 user_id,
-                f"🎉 <b>Вам выдан VPN доступ на {days} дней!</b>\n\n"
-                f"Нажмите кнопку ниже чтобы выбрать тип устройства:",
-                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
-                    types.InlineKeyboardButton(
-                        text="🔐 Выбрать устройство",
-                        url=f"https://t.me/{(await bot.get_me()).username}?start=getvpn_{user_id}_{days}"
-                    )
-                ]]),
+                f"🎉 <b>Администратор выдал вам VPN доступ на {days} дней!</b>\n\n"
+                f"Конфигурация уже отправлена вам в чат.\n"
+                f"Приятного использования!",
                 parse_mode=ParseMode.HTML
             )
-            
-            await message.answer(
-                f"✅ Пользователю {user_id} отправлено приглашение!\n"
-                f"Он должен нажать кнопку и выбрать устройство.",
-                reply_markup=admin_main_menu()
-            )
-            
         except Exception as e:
-            await message.answer(
-                f"❌ Не удалось отправить сообщение пользователю {user_id}\n"
-                f"Ошибка: {str(e)}",
-                reply_markup=admin_main_menu()
-            )
-    
-    elif service == "bot":
-        # Создаем бота
-        success = await create_bot_for_user(user_id, days)
+            logger.error(f"Не удалось отправить уведомление пользователю: {e}")
         
-        if success:
-            await message.answer(
-                f"✅ Бот успешно выдан пользователю {user_id} на {days} дней!",
-                reply_markup=admin_main_menu()
-            )
-        else:
-            await message.answer(
-                f"❌ Ошибка выдачи бота пользователю {user_id}",
-                reply_markup=admin_main_menu()
-            )
+        await message.answer(
+            f"✅ VPN успешно выдан пользователю {user_id} на {days} дней!",
+            reply_markup=admin_main_menu()
+        )
+    else:
+        await message.answer(
+            f"❌ Ошибка выдачи VPN пользователю {user_id}",
+            reply_markup=admin_main_menu()
+        )
     
     await state.clear()
 
@@ -1388,10 +1655,10 @@ async def admin_prices(message: Message):
     text = "💰 <b>Текущие цены:</b>\n\n"
     text += "<b>VPN:</b>\n"
     text += f"• Неделя: {vpn_prices['week']['stars']} stars\n"
-    text += f"• Месяц: {vpn_prices['month']['stars']} stars (3x недели)\n\n"
+    text += f"• Месяц: {vpn_prices['month']['stars']} stars\n\n"
     text += "<b>Боты:</b>\n"
     text += f"• Неделя: {bot_prices['week']['stars']} stars\n"
-    text += f"• Месяц: {bot_prices['month']['stars']} stars (3x недели)\n\n"
+    text += f"• Месяц: {bot_prices['month']['stars']} stars\n\n"
     text += "Выберите что изменить:"
     
     await message.answer(text, reply_markup=admin_prices_menu(), parse_mode=ParseMode.HTML)
@@ -1443,6 +1710,10 @@ async def admin_process_week_price(message: Message, state: FSMContext):
     """Обработка цены за неделю"""
     try:
         week_price = int(message.text)
+        if week_price <= 0:
+            await message.answer("Цена должна быть больше 0:")
+            return
+            
         await state.update_data(week_price=week_price)
         await state.set_state(AdminPriceStates.waiting_for_confirm)
         
@@ -1451,10 +1722,13 @@ async def admin_process_week_price(message: Message, state: FSMContext):
         
         service_name = "VPN" if service_type == "vpn" else "ботов"
         
+        # Месяц всегда в 3 раза дороже недели
+        month_price = week_price * 3
+        
         await message.answer(
             f"<b>Новые цены для {service_name}:</b>\n\n"
             f"• Неделя: {week_price} stars\n"
-            f"• Месяц: {week_price * 3} stars (3x недели)\n\n"
+            f"• Месяц: {month_price} stars\n\n"
             f"Подтвердите изменение:",
             reply_markup=confirm_keyboard(),
             parse_mode=ParseMode.HTML
@@ -1469,12 +1743,13 @@ async def admin_confirm_prices(message: Message, state: FSMContext):
         data = await state.get_data()
         service_type = data.get('service_type')
         week_price = data.get('week_price')
+        month_price = week_price * 3
         
         if service_type == "vpn":
-            await update_vpn_prices(week_price, week_price * 3)
+            await update_vpn_prices(week_price, month_price)
             service_name = "VPN"
         elif service_type == "bot":
-            await update_bot_prices(week_price, week_price * 3)
+            await update_bot_prices(week_price, month_price)
             service_name = "ботов"
         else:
             service_name = "услуги"
@@ -1482,7 +1757,7 @@ async def admin_confirm_prices(message: Message, state: FSMContext):
         await message.answer(
             f"✅ Цены {service_name} обновлены!\n\n"
             f"• Неделя: {week_price} stars\n"
-            f"• Месяц: {week_price * 3} stars",
+            f"• Месяц: {month_price} stars",
             reply_markup=admin_main_menu()
         )
     
@@ -1547,8 +1822,31 @@ async def admin_disable_vpn(message: Message):
         "Введите ID пользователя для отключения VPN:",
         reply_markup=ReplyKeyboardRemove()
     )
+
+@dp.message(F.text == "🤖 Создать тестового бота")
+async def admin_create_test_bot(message: Message):
+    """Создание тестового бота для проверки сервера"""
+    if not is_admin(message.from_user.id, message.chat.id):
+        return
     
-    # Здесь нужно добавить обработчик
+    await message.answer("🔄 Создаю тестового бота на 1 день для проверки сервера...")
+    
+    # Создаем бота на 1 день
+    success = await create_bot_for_user(message.from_user.id, 1)
+    
+    if success:
+        await message.answer(
+            "✅ <b>Тестовый бот создан на 1 день!</b>\n\n"
+            "Инструкция отправлена вам в чат.\n"
+            "Это поможет проверить работоспособность сервера для ботов.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await message.answer(
+            "❌ <b>Ошибка создания тестового бота!</b>\n\n"
+            "Возможно, нет доступных серверов или проблема с SSH подключением.",
+            parse_mode=ParseMode.HTML
+        )
 
 @dp.message(F.text == "◀️ Назад")
 async def back_handler(message: Message, state: FSMContext):
@@ -1633,7 +1931,7 @@ async def main():
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = await cursor.fetchall()
-            logger.info(f"Таблицы в БД: {[t[0] for t in tables]}")
+            logger.info(f"✅ Таблицы в БД: {[t[0] for t in tables]}")
         
         # Запускаем фоновые задачи
         asyncio.create_task(check_expired_subscriptions())
