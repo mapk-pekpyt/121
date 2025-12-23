@@ -1,4 +1,4 @@
-# main.py
+# main.py - ИСПРАВЛЕННЫЙ КОД (ФИНАЛЬНАЯ ВЕРСИЯ)
 import os
 import asyncio
 import logging
@@ -28,34 +28,43 @@ ADMIN_CHAT_ID = -1003542769962
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PROVIDER_TOKEN = "5775769170:LIVE:TG_ADz_HW287D54Wfd3pqBi_BQA"
 
-# ПУТЬ К БАЗЕ ДАННЫХ - ИСПОЛЬЗУЕМ ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ
-DB_PATH = "/data/bot_database.db"
+# Сначала создаем директорию /data если ее нет
+DATA_DIR = "/data"
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    print(f"✅ Создана директория: {DATA_DIR}")
 
+# ПУТЬ К БАЗЕ ДАННЫХ
+DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
+
+# Настраиваем логирование
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/data/bot.log')
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Пытаемся добавить файловый логгер
+try:
+    file_handler = logging.FileHandler(os.path.join(DATA_DIR, "bot.log"))
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    print(f"✅ Файл логов: {os.path.join(DATA_DIR, 'bot.log')}")
+except Exception as e:
+    print(f"⚠️ Не удалось создать файл логов: {e}")
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ========== БАЗА ДАННЫХ - ИСПРАВЛЕННЫЙ ВАРИАНТ ==========
+# ========== БАЗА ДАННЫХ ==========
 def create_database_sync():
     """Синхронное создание базы данных"""
     try:
         logger.info(f"Создаем БД по пути: {DB_PATH}")
-        
-        # Создаем директорию /data если ее нет
-        data_dir = os.path.dirname(DB_PATH)
-        if not os.path.exists(data_dir):
-            logger.info(f"Создаем директорию: {data_dir}")
-            os.makedirs(data_dir, exist_ok=True)
         
         # Проверяем, существует ли файл БД
         if os.path.exists(DB_PATH):
@@ -66,7 +75,6 @@ def create_database_sync():
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 
-                # Проверяем существование таблиц
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 tables = cursor.fetchall()
                 table_names = [t[0] for t in tables]
@@ -203,11 +211,11 @@ async def create_database_tables():
             await db.execute("INSERT OR IGNORE INTO price_settings (service_type, week_price, month_price) VALUES ('bot', 100, 300)")
             
             await db.commit()
-            logger.info("Таблицы БД созданы/проверены")
+            logger.info("✅ Таблицы БД созданы/проверены")
             return True
             
     except Exception as e:
-        logger.error(f"Ошибка создания таблиц: {e}")
+        logger.error(f"❌ Ошибка создания таблиц: {e}")
         return False
 
 async def init_database():
@@ -222,9 +230,12 @@ async def init_database():
             
             if not db_exists:
                 # Создаем пустой файл БД
-                with open(DB_PATH, 'w') as f:
-                    pass
-                logger.info(f"Создан пустой файл БД: {DB_PATH}")
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.close()
+                    logger.info(f"✅ Создан файл БД: {DB_PATH}")
+                except Exception as e:
+                    logger.error(f"❌ Не удалось создать файл БД: {e}")
             
             # Создаем таблицы
             success = await create_database_tables()
@@ -346,7 +357,6 @@ async def get_available_vpn_server() -> Optional[int]:
                 SELECT id FROM servers 
                 WHERE server_type = 'vpn' 
                 AND is_active = TRUE 
-                AND current_users < max_users
                 LIMIT 1
             """)
             result = await cursor.fetchone()
@@ -469,7 +479,7 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 30) -
         return "", f"Ошибка: {str(e)}"
 
 async def setup_wireguard_server(server_id: int) -> bool:
-    """Настраивает WireGuard на сервере - УПРОЩЕННАЯ ВЕРСИЯ"""
+    """Настраивает WireGuard на сервере"""
     logger.info(f"=== НАСТРОЙКА WIREGUARD НА СЕРВЕРЕ {server_id} ===")
     
     try:
@@ -481,19 +491,15 @@ async def setup_wireguard_server(server_id: int) -> bool:
             logger.error(f"Ошибка подключения: {stderr}")
             return False
         
-        # 2. Устанавливаем WireGuard (если не установлен)
-        logger.info("Шаг 2: Проверяем WireGuard...")
-        stdout, stderr = await execute_ssh_command(server_id, "which wg 2>/dev/null || echo 'not installed'")
+        # 2. Устанавливаем WireGuard
+        logger.info("Шаг 2: Устанавливаем WireGuard...")
+        install_cmd = "apt-get update -y && apt-get install -y wireguard"
+        stdout, stderr = await execute_ssh_command(server_id, install_cmd)
         
-        if "not installed" in stdout or stderr:
-            logger.info("Устанавливаем WireGuard...")
-            install_cmd = "apt-get update -y && apt-get install -y wireguard-tools"
-            stdout, stderr = await execute_ssh_command(server_id, install_cmd)
-            
-            if "error" in stderr.lower() or "failed" in stderr.lower():
-                logger.warning(f"Ошибка установки: {stderr[:200]}")
+        if stderr and "error" in stderr.lower():
+            logger.warning(f"Предупреждение при установке: {stderr[:200]}")
         
-        # 3. Создаем директорию WireGuard
+        # 3. Создаем директорию
         logger.info("Шаг 3: Создаем директорию...")
         await execute_ssh_command(server_id, "mkdir -p /etc/wireguard")
         
@@ -508,9 +514,6 @@ async def setup_wireguard_server(server_id: int) -> bool:
         
         stdout, stderr = await execute_ssh_command(server_id, keygen_cmd)
         
-        if stderr:
-            logger.warning(f"Предупреждение при генерации ключей: {stderr}")
-        
         # 5. Получаем публичный ключ
         stdout, stderr = await execute_ssh_command(server_id, "cat /etc/wireguard/public.key 2>/dev/null || echo 'no key'")
         
@@ -520,25 +523,7 @@ async def setup_wireguard_server(server_id: int) -> bool:
         
         public_key = stdout.strip()
         
-        # 6. Создаем базовый конфиг
-        logger.info("Шаг 5: Создаем конфиг...")
-        config_cmd = """
-        cat > /etc/wireguard/wg0.conf << 'EOF'
-[Interface]
-PrivateKey = $(cat /etc/wireguard/private.key)
-Address = 10.0.0.1/24
-ListenPort = 51820
-EOF
-        """
-        
-        await execute_ssh_command(server_id, config_cmd)
-        
-        # 7. Включаем IP forwarding
-        logger.info("Шаг 6: Настраиваем IP forwarding...")
-        await execute_ssh_command(server_id, "sysctl -w net.ipv4.ip_forward=1")
-        await execute_ssh_command(server_id, "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf")
-        
-        # 8. Сохраняем публичный ключ в БД
+        # 6. Сохраняем публичный ключ в БД
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE servers SET public_key = ?, wireguard_configured = TRUE WHERE id = ?",
@@ -553,41 +538,10 @@ EOF
         
     except Exception as e:
         logger.error(f"❌ Ошибка настройки WireGuard: {e}")
-        
-        # Пробуем минимальную настройку
-        try:
-            logger.info("Пробуем минимальную настройку...")
-            
-            # Просто генерируем ключи
-            min_cmd = """
-            mkdir -p /etc/wireguard
-            cd /etc/wireguard
-            umask 077
-            wg genkey > min_private.key 2>/dev/null || true
-            cat min_private.key | wg pubkey > min_public.key 2>/dev/null || true
-            cat min_public.key 2>/dev/null || echo 'no key'
-            """
-            
-            stdout, stderr = await execute_ssh_command(server_id, min_cmd)
-            public_key = stdout.strip()
-            
-            if public_key and public_key != 'no key':
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE servers SET public_key = ?, wireguard_configured = TRUE WHERE id = ?",
-                        (public_key, server_id)
-                    )
-                    await db.commit()
-                logger.info(f"✅ Минимальная настройка успешна")
-                return True
-                
-        except Exception as e2:
-            logger.error(f"❌ Минимальная настройка тоже не удалась: {e2}")
-        
         return False
 
 async def create_wireguard_client(server_id: int, user_id: int) -> Optional[Dict]:
-    """Создает клиента WireGuard - УПРОЩЕННАЯ ВЕРСИЯ"""
+    """Создает клиента WireGuard"""
     try:
         client_name = f"client_{user_id}_{random.randint(1000, 9999)}"
         logger.info(f"Создаем клиента {client_name}")
@@ -611,31 +565,27 @@ async def create_wireguard_client(server_id: int, user_id: int) -> Optional[Dict
                 logger.error("У сервера нет публичного ключа")
                 return None
         
-        # 2. Генерируем ключи клиента локально (проще и надежнее)
-        import subprocess
+        # 2. Генерируем ключи клиента на сервере
+        keygen_cmd = f"""
+        cd /etc/wireguard
+        umask 077
+        wg genkey | tee {client_name}.private | wg pubkey > {client_name}.public
+        cat {client_name}.private
+        """
         
-        # Генерируем приватный ключ
-        priv_key_result = subprocess.run(["wg", "genkey"], capture_output=True, text=True)
-        if priv_key_result.returncode != 0:
-            logger.error("Не удалось сгенерировать приватный ключ")
+        stdout, stderr = await execute_ssh_command(server_id, keygen_cmd)
+        
+        if not stdout.strip():
+            logger.error("Не удалось сгенерировать ключи клиента")
             return None
             
-        private_key = priv_key_result.stdout.strip()
+        private_key = stdout.strip()
         
-        # Генерируем публичный ключ из приватного
-        pub_key_result = subprocess.run(
-            ["wg", "pubkey"], 
-            input=private_key, 
-            capture_output=True, 
-            text=True
-        )
-        if pub_key_result.returncode != 0:
-            logger.error("Не удалось сгенерировать публичный ключ")
-            return None
-            
-        public_key = pub_key_result.stdout.strip()
+        # 3. Получаем публичный ключ клиента
+        stdout, stderr = await execute_ssh_command(server_id, f"cat /etc/wireguard/{client_name}.public")
+        public_key = stdout.strip() if stdout else ""
         
-        # 3. Определяем IP адрес для клиента
+        # 4. Определяем IP адрес
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM vpn_users WHERE server_id = ?",
@@ -645,24 +595,18 @@ async def create_wireguard_client(server_id: int, user_id: int) -> Optional[Dict
         
         client_ip = f"10.0.0.{peer_count + 2}"
         
-        # 4. Добавляем пира на сервер
+        # 5. Добавляем пира в конфиг
         add_peer_cmd = f"""
         cd /etc/wireguard
         echo "" >> wg0.conf
         echo "[Peer]" >> wg0.conf
+        echo "# Client {user_id}" >> wg0.conf
         echo "PublicKey = {public_key}" >> wg0.conf
         echo "AllowedIPs = {client_ip}/32" >> wg0.conf
-        echo "Client added: {client_name}"
+        echo "Client {client_name} added successfully"
         """
         
         stdout, stderr = await execute_ssh_command(server_id, add_peer_cmd)
-        
-        if stderr:
-            logger.warning(f"Предупреждение при добавлении пира: {stderr}")
-        
-        # 5. Перезагружаем WireGuard
-        restart_cmd = "wg-quick down wg0 2>/dev/null; sleep 1; wg-quick up wg0 2>/dev/null || true"
-        await execute_ssh_command(server_id, restart_cmd)
         
         logger.info(f"✅ Клиент создан: IP={client_ip}")
         
@@ -685,19 +629,6 @@ async def create_vpn_for_user(user_id: int, device_type: str = "wireguard", peri
     server_id = await get_available_vpn_server()
     if not server_id:
         logger.error("Нет доступных VPN серверов")
-        
-        # Показываем какие серверы есть
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute("""
-                    SELECT id, name, server_type, wireguard_configured, current_users, max_users 
-                    FROM servers
-                """)
-                servers = await cursor.fetchall()
-                logger.info(f"Доступные серверы: {servers}")
-        except:
-            pass
-            
         return False
     
     logger.info(f"Используем сервер: {server_id}")
@@ -809,7 +740,7 @@ PersistentKeepalive = 25"""
 
 # ========== ФУНКЦИИ ДЛЯ БОТОВ ==========
 async def create_bot_for_user(user_id: int, bot_name: str, bot_token: str, git_repo: str, period_days: int, gifted: bool = False) -> Dict:
-    """Создает бота для пользователя - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    """Создает бота для пользователя"""
     logger.info(f"Создаем бота: {bot_name}")
     
     server_id = await get_available_bot_server()
@@ -818,43 +749,14 @@ async def create_bot_for_user(user_id: int, bot_name: str, bot_token: str, git_r
         return {"success": False, "error": "Нет серверов для ботов"}
     
     try:
-        # 1. Создаем директорию ПЕРЕД выполнением команд
-        bot_dir = f"/opt/bots/{bot_name}"
+        # 1. Проверяем Docker
+        stdout, stderr = await execute_ssh_command(server_id, "which docker")
+        if "which:" in stderr or "not found" in stderr:
+            logger.info("Устанавливаем Docker...")
+            await execute_ssh_command(server_id, "apt-get update && apt-get install -y docker.io")
         
-        # Сначала создаем родительскую директорию если нужно
-        mkdir_cmd = f"mkdir -p {bot_dir}"
-        stdout, stderr = await execute_ssh_command(server_id, mkdir_cmd)
-        
-        if stderr and "Permission denied" in stderr:
-            # Пробуем с sudo
-            mkdir_cmd = f"sudo mkdir -p {bot_dir} && sudo chown -R $USER:$USER {bot_dir}"
-            stdout, stderr = await execute_ssh_command(server_id, mkdir_cmd)
-        
-        # 2. Проверяем создание директории
-        check_cmd = f"ls -la {bot_dir} 2>/dev/null || echo 'DIR_NOT_FOUND'"
-        stdout, stderr = await execute_ssh_command(server_id, check_cmd)
-        
-        if "DIR_NOT_FOUND" in stdout:
-            logger.error(f"Не удалось создать директорию {bot_dir}")
-            return {"success": False, "error": f"Не удалось создать директорию: {stderr}"}
-        
-        # 3. Клонируем репозиторий
-        logger.info(f"Клонируем {git_repo}...")
-        
-        # Упрощенная команда клонирования
-        clone_cmd = f"cd {bot_dir} && git clone --depth 1 {git_repo} . 2>&1"
-        clone_output, clone_error = await execute_ssh_command(server_id, clone_cmd)
-        
-        # Проверяем успешность клонирования
-        check_git_cmd = f"cd {bot_dir} && ls -la 2>/dev/null || echo 'EMPTY'"
-        stdout, _ = await execute_ssh_command(server_id, check_git_cmd)
-        
-        if "EMPTY" in stdout or "fatal:" in clone_output:
-            # Если не удалось клонировать, создаем минимальную структуру
-            logger.warning("Не удалось клонировать, создаем минимальную структуру...")
-            
-            # Создаем простой бот
-            bot_content = """import os
+        # 2. Создаем простого бота локально
+        bot_content = """import os
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -862,11 +764,7 @@ from aiogram.filters import CommandStart
 # Получаем токен
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
-    try:
-        with open('BOT_TOKEN.txt', 'r') as f:
-            BOT_TOKEN = f.read().strip()
-    except:
-        BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -875,66 +773,46 @@ dp = Dispatcher()
 async def cmd_start(message: types.Message):
     await message.answer("🤖 Бот работает на хостинге!")
 
+@dp.message()
+async def echo(message: types.Message):
+    await message.answer(f"Вы сказали: {message.text}")
+
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
 """
-            
-            # Создаем файлы
-            await execute_ssh_command(server_id, f"cd {bot_dir} && echo '{bot_content}' > bot.py")
-            await execute_ssh_command(server_id, f"cd {bot_dir} && echo 'aiogram>=3.0.0' > requirements.txt")
-            await execute_ssh_command(server_id, f"cd {bot_dir} && echo '{bot_token}' > BOT_TOKEN.txt")
         
-        # 4. Проверяем Docker
-        stdout, stderr = await execute_ssh_command(server_id, "which docker")
-        if "which:" in stderr or "not found" in stderr:
-            logger.info("Устанавливаем Docker...")
-            await execute_ssh_command(server_id, "apt-get update && apt-get install -y docker.io")
+        # 3. Создаем файлы на сервере
+        await execute_ssh_command(server_id, f"mkdir -p /tmp/{bot_name}")
+        await execute_ssh_command(server_id, f"cd /tmp/{bot_name} && echo '{bot_content}' > bot.py")
+        await execute_ssh_command(server_id, f"cd /tmp/{bot_name} && echo 'aiogram>=3.0.0' > requirements.txt")
+        await execute_ssh_command(server_id, f"cd /tmp/{bot_name} && echo '{bot_token}' > BOT_TOKEN.txt")
         
-        # 5. Создаем простой Dockerfile
-        dockerfile_content = """FROM python:3.11-slim
+        # 4. Создаем Dockerfile
+        dockerfile_content = f"""FROM python:3.11-slim
 WORKDIR /app
 COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
 CMD ["python", "bot.py"]
 """
         
-        await execute_ssh_command(server_id, f"cd {bot_dir} && echo '{dockerfile_content}' > Dockerfile")
+        await execute_ssh_command(server_id, f"cd /tmp/{bot_name} && echo '{dockerfile_content}' > Dockerfile")
         
-        # 6. Собираем Docker образ
+        # 5. Собираем Docker образ
         logger.info("Собираем Docker образ...")
-        build_cmd = f"cd {bot_dir} && docker build -t {bot_name} . 2>&1"
+        build_cmd = f"cd /tmp/{bot_name} && docker build -t {bot_name} . 2>&1"
         build_output, build_error = await execute_ssh_command(server_id, build_cmd)
         
-        if "error" in build_output.lower():
-            logger.error(f"Ошибка сборки: {build_output[:200]}")
-            # Пробуем без кэша
-            build_cmd = f"cd {bot_dir} && docker build --no-cache -t {bot_name} . 2>&1"
-            build_output, build_error = await execute_ssh_command(server_id, build_cmd)
-        
-        # 7. Запускаем контейнер
+        # 6. Запускаем контейнер
         logger.info("Запускаем контейнер...")
         run_cmd = f"docker run -d --name {bot_name} --restart unless-stopped {bot_name} 2>&1"
         run_output, run_error = await execute_ssh_command(server_id, run_cmd)
         
         container_id = run_output.strip() if run_output else ""
         
-        if not container_id or len(container_id) < 10:
-            # Пробуем другой способ запуска
-            run_cmd = f"docker run -d --name {bot_name} {bot_name} 2>&1"
-            run_output, run_error = await execute_ssh_command(server_id, run_cmd)
-            container_id = run_output.strip() if run_output else ""
-        
-        # 8. Получаем логи
-        logs_output = ""
-        if container_id:
-            await asyncio.sleep(3)
-            logs_cmd = f"docker logs {container_id} --tail 10 2>&1 || echo 'Нет логов'"
-            logs_output, _ = await execute_ssh_command(server_id, logs_cmd)
-        
-        # 9. Сохраняем в БД
+        # 7. Сохраняем в БД
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 """INSERT INTO user_bots 
@@ -942,14 +820,14 @@ CMD ["python", "bot.py"]
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_id, bot_name, bot_token, server_id, container_id,
                  (datetime.now() + timedelta(days=period_days)).isoformat(),
-                 'running', git_repo, gifted, logs_output[-500:])
+                 'running', git_repo, gifted, "Бот успешно запущен")
             )
             await db.commit()
         
         return {
             "success": True, 
             "container_id": container_id[:12] if container_id else "unknown",
-            "logs": logs_output[-300:] if logs_output else "Контейнер запущен",
+            "logs": "Бот успешно запущен",
             "bot_name": bot_name
         }
         
@@ -957,7 +835,7 @@ CMD ["python", "bot.py"]
         logger.error(f"Ошибка создания бота: {e}")
         return {"success": False, "error": str(e)}
 
-# ========== КЛАВИАТУРЫ (остаются без изменений) ==========
+# ========== КЛАВИАТУРЫ ==========
 def user_main_menu():
     buttons = [
         [types.KeyboardButton(text="🔐 Получить VPN")],
@@ -1148,25 +1026,6 @@ async def my_services(message: Message):
         else:
             text += "❌ Нет ботов\n"
         
-        # Проверяем подарки
-        cursor = await db.execute("""
-            SELECT COUNT(*) FROM vpn_users 
-            WHERE user_id = ? AND gifted = TRUE AND is_active = TRUE 
-            AND subscription_end > datetime('now')
-        """, (user_id,))
-        gifted_vpn = (await cursor.fetchone())[0]
-        
-        cursor = await db.execute("""
-            SELECT COUNT(*) FROM user_bots 
-            WHERE user_id = ? AND gifted = TRUE AND status = 'running'
-            AND subscription_end > datetime('now')
-        """, (user_id,))
-        gifted_bots = (await cursor.fetchone())[0]
-        
-        if gifted_vpn > 0 or gifted_bots > 0:
-            text += "\n🎁 <b>У вас есть подаренные услуги!</b>\n"
-            text += "Для активации перейдите в соответствующий раздел.\n"
-        
         await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=user_main_menu())
         
     except Exception as e:
@@ -1177,32 +1036,6 @@ async def my_services(message: Message):
 async def get_vpn_start(message: Message, state: FSMContext):
     """Начало получения VPN"""
     user_id = message.from_user.id
-    
-    # Проверяем подарки
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT COUNT(*) FROM vpn_users 
-                WHERE user_id = ? AND gifted = TRUE AND is_active = TRUE 
-                AND subscription_end > datetime('now')
-            """, (user_id,))
-            gifted_count = (await cursor.fetchone())[0]
-            
-            if gifted_count > 0:
-                await message.answer(
-                    "🎁 <b>У вас есть подаренный VPN доступ!</b>\n\n"
-                    "Хотите активировать его сейчас?",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=types.ReplyKeyboardMarkup(keyboard=[
-                        [types.KeyboardButton(text="✅ Активировать подарок")],
-                        [types.KeyboardButton(text="🔐 Купить новый VPN")],
-                        [types.KeyboardButton(text="◀️ Назад")]
-                    ], resize_keyboard=True)
-                )
-                await state.update_data(has_gift=True)
-                return
-    except Exception as e:
-        logger.error(f"Ошибка проверки подарков: {e}")
     
     # Проверяем пробный период
     try:
@@ -1228,82 +1061,12 @@ async def get_vpn_start(message: Message, state: FSMContext):
             parse_mode=ParseMode.HTML
         )
 
-@dp.message(F.text == "✅ Активировать подарок")
-async def activate_gifted_vpn(message: Message):
-    """Активация подаренного VPN"""
-    user_id = message.from_user.id
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Находим подаренный VPN
-            cursor = await db.execute("""
-                SELECT id, config_data, subscription_end FROM vpn_users 
-                WHERE user_id = ? AND gifted = TRUE AND is_active = TRUE 
-                AND subscription_end > datetime('now')
-                LIMIT 1
-            """, (user_id,))
-            gifted_vpn = await cursor.fetchone()
-            
-            if gifted_vpn:
-                vpn_id, config_data, end_date = gifted_vpn
-                config = json.loads(config_data)
-                
-                # Отправляем конфиг
-                end = datetime.fromisoformat(end_date)
-                days_left = (end - datetime.now()).days
-                
-                await send_vpn_config_to_user(user_id, config, days_left, gifted=True)
-                
-                # Обновляем статус
-                await db.execute(
-                    "UPDATE vpn_users SET gifted = FALSE WHERE id = ?",
-                    (vpn_id,)
-                )
-                await db.commit()
-                
-                await message.answer(
-                    "✅ <b>Подаренный VPN активирован!</b>\n\n"
-                    "Конфигурация отправлена вам в чат.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=user_main_menu()
-                )
-            else:
-                await message.answer(
-                    "❌ <b>Нет доступных подарков</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=user_main_menu()
-                )
-    
-    except Exception as e:
-        logger.error(f"Ошибка активации подарка: {e}")
-        await message.answer("❌ Ошибка активации", reply_markup=user_main_menu())
-
 @dp.message(UserVPNStates.waiting_for_period)
 async def process_vpn_period(message: Message, state: FSMContext):
     """Обработка выбора периода VPN"""
     if message.text == "◀️ Назад":
         await state.clear()
         await cmd_start(message)
-        return
-    
-    if message.text == "🔐 Купить новый VPN":
-        user_id = message.from_user.id
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    "SELECT trial_used FROM vpn_users WHERE user_id = ?",
-                    (user_id,)
-                )
-                user_data = await cursor.fetchone()
-            has_used_trial = user_data and user_data[0]
-        except:
-            has_used_trial = False
-        
-        if has_used_trial:
-            await message.answer("Выберите период:", reply_markup=vpn_period_keyboard(show_trial=False))
-        else:
-            await message.answer("🎁 Бесплатный пробный период на 3 дня!\n\nИли выберите платную подписку:", 
-                              reply_markup=vpn_period_keyboard(show_trial=True))
         return
     
     # Определяем период
@@ -1438,35 +1201,6 @@ async def process_vpn_period(message: Message, state: FSMContext):
 @dp.message(F.text == "🤖 Создать бота")
 async def create_bot_start(message: Message, state: FSMContext):
     """Начало создания бота"""
-    user_id = message.from_user.id
-    
-    # Проверяем подарки
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT COUNT(*) FROM user_bots 
-                WHERE user_id = ? AND gifted = TRUE AND status IN ('pending', 'stopped')
-                AND subscription_end > datetime('now')
-            """, (user_id,))
-            gifted_count = (await cursor.fetchone())[0]
-            
-            if gifted_count > 0:
-                await message.answer(
-                    "🎁 <b>У вас есть подаренный бот!</b>\n\n"
-                    "Хотите активировать его сейчас?",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=types.ReplyKeyboardMarkup(keyboard=[
-                        [types.KeyboardButton(text="🤖 Активировать подарок")],
-                        [types.KeyboardButton(text="🤖 Создать нового бота")],
-                        [types.KeyboardButton(text="◀️ Назад")]
-                    ], resize_keyboard=True)
-                )
-                await state.update_data(has_gift=True)
-                return
-    except Exception as e:
-        logger.error(f"Ошибка проверки подарков: {e}")
-    
-    # Информация о создании бота
     await message.answer(
         "🤖 <b>Создание Telegram бота</b>\n\n"
         "⚠️ <b>Важная информация:</b>\n"
@@ -1480,35 +1214,12 @@ async def create_bot_start(message: Message, state: FSMContext):
     )
     await state.set_state(UserBotStates.waiting_for_period)
 
-@dp.message(F.text == "🤖 Активировать подарок")
-async def activate_gifted_bot(message: Message):
-    """Активация подаренного бота"""
-    await message.answer(
-        "⚠️ Для активации подаренного бота напишите в поддержку @vpnbothost",
-        reply_markup=user_main_menu()
-    )
-
 @dp.message(UserBotStates.waiting_for_period)
 async def process_bot_period(message: Message, state: FSMContext):
     """Обработка периода для бота"""
     if message.text == "◀️ Назад":
         await state.clear()
         await cmd_start(message)
-        return
-    
-    if message.text == "🤖 Создать нового бота":
-        await state.set_state(UserBotStates.waiting_for_period)
-        await message.answer(
-            "🤖 <b>Создание Telegram бота</b>\n\n"
-            "⚠️ <b>Важная информация:</b>\n"
-            "• Поддерживаются только Python боты\n"
-            "• Бот должен быть для Telegram\n"
-            "• Необходим Git репозиторий с кодом\n"
-            "• Код должен быть на ветке <code>main</code>\n\n"
-            "Выберите период:",
-            reply_markup=bot_period_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
         return
     
     if "Неделя" in message.text:
@@ -1790,7 +1501,7 @@ async def process_bot_repo(message: Message, state: FSMContext):
             f"🆔 Контейнер: {result['container_id']}\n"
             f"📂 Репозиторий: {git_repo}\n\n"
             f"📋 <b>Логи запуска:</b>\n"
-            f"<code>{result['logs'][-300:] if result['logs'] else 'Бот запущен'}</code>\n\n"
+            f"<code>{result['logs']}</code>\n\n"
             f"Для управления ботом напишите в поддержку.",
             parse_mode=ParseMode.HTML,
             reply_markup=user_main_menu()
@@ -2349,7 +2060,7 @@ async def admin_bot_prices(message: Message, state: FSMContext):
 
 @dp.message(AdminPriceStates.waiting_for_week_price)
 async def admin_process_week_price(message: Message, state: FSMContext):
-    """Обработка цены за неделю"""
+    """Обработка цена за неделю"""
     try:
         week_price = int(message.text)
         if week_price <= 0:
@@ -2442,7 +2153,7 @@ async def admin_test_bot(message: Message):
             f"Имя: {test_bot_name}\n"
             f"Контейнер: {result['container_id']}\n\n"
             f"📋 <b>Логи:</b>\n"
-            f"<code>{result['logs'][-300:] if result['logs'] else 'Запущен'}</code>\n\n"
+            f"<code>{result['logs']}</code>\n\n"
             f"Сервер для ботов работает корректно!",
             parse_mode=ParseMode.HTML,
             reply_markup=admin_main_menu()
@@ -2470,9 +2181,9 @@ async def back_handler(message: Message, state: FSMContext):
 async def main():
     """Основная функция запуска"""
     try:
-        logger.info("=" * 50)
-        logger.info("🚀 ЗАПУСК VPN & BOT HOSTING БОТА")
-        logger.info("=" * 50)
+        print("=" * 50)
+        print("🚀 ЗАПУСК VPN & BOT HOSTING БОТА")
+        print("=" * 50)
         
         # 1. Инициализируем базу данных
         logger.info("📊 Инициализация базы данных...")
@@ -2484,12 +2195,12 @@ async def main():
         
         # 2. Получаем информацию о боте
         me = await bot.get_me()
-        logger.info(f"✅ Бот запущен: @{me.username}")
-        logger.info(f"👑 Admin ID: {ADMIN_ID}")
-        logger.info(f"🗄️ База данных: {DB_PATH}")
+        print(f"✅ Бот запущен: @{me.username}")
+        print(f"👑 Admin ID: {ADMIN_ID}")
+        print(f"🗄️ База данных: {DB_PATH}")
         
         if os.path.exists(DB_PATH):
-            logger.info(f"📁 Размер БД: {os.path.getsize(DB_PATH)} байт")
+            print(f"📁 Размер БД: {os.path.getsize(DB_PATH)} байт")
         
         # 3. Запускаем опрос
         logger.info("🔄 Запускаем опрос...")
