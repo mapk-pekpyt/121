@@ -1,4 +1,4 @@
-# main.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# main.py - ТОЛЬКО ФАЙЛЫ С КЛЮЧАМИ
 import os
 import asyncio
 import logging
@@ -147,8 +147,6 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 60, u
             import stat
             
             ssh_key_clean = ssh_key.strip()
-            if not ssh_key_clean.startswith('-----BEGIN'):
-                ssh_key_clean = f"-----BEGIN PRIVATE KEY-----\n{ssh_key_clean}\n-----END PRIVATE KEY-----"
             
             with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
                 f.write(ssh_key_clean)
@@ -412,31 +410,13 @@ async def process_server_name(message: Message, state: FSMContext):
     await state.update_data(server_name=message.text)
     await state.set_state(AdminAddServerStates.waiting_for_key)
     await message.answer(
-        "Отправьте приватный SSH ключ:\n\n"
-        "📎 <b>Пришлите файл с ключом</b> (формат .key, .pem) ИЛИ\n"
-        "📝 <b>Вставьте текст ключа</b> (начинается с -----BEGIN)",
+        "📎 <b>Пришлите файл с SSH ключом</b> (формат .key, .pem)\n\n"
+        "Файл должен быть в формате приватного ключа SSH",
         reply_markup=back_keyboard(),
         parse_mode=ParseMode.HTML
     )
 
-# Обработчик для текстового ключа
-@dp.message(AdminAddServerStates.waiting_for_key)
-async def process_ssh_key_text(message: Message, state: FSMContext):
-    if message.text == "◀️ Назад":
-        await state.clear()
-        await message.answer("🖥️ <b>Управление серверами</b>", reply_markup=servers_menu(), parse_mode=ParseMode.HTML)
-        return
-    
-    # Проверяем, похож ли текст на SSH ключ
-    text = message.text.strip()
-    if '-----BEGIN' in text and '-----END' in text:
-        await state.update_data(ssh_key=text)
-        await state.set_state(AdminAddServerStates.waiting_for_connection)
-        await message.answer("✅ Ключ принят!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
-    else:
-        await message.answer("❌ Это не похоже на SSH ключ. Отправьте файл с ключом (.key) или текст ключа:")
-
-# Обработчик для файлов с ключами
+# Обработчик ТОЛЬКО для файлов с ключами
 @dp.message(AdminAddServerStates.waiting_for_key, F.document)
 async def process_ssh_key_file(message: Message, state: FSMContext):
     if not message.document:
@@ -470,17 +450,34 @@ async def process_ssh_key_file(message: Message, state: FSMContext):
             except:
                 key_text = file_content.decode('utf-8', errors='ignore')
         
-        # Проверяем, что это SSH ключ
+        # Проверяем, что это SSH ключ (добавляем маркеры если нужно)
         if '-----BEGIN' not in key_text:
-            await message.answer("❌ Файл не содержит SSH ключ в PEM формате")
-            return
+            # Попробуем добавить маркеры
+            key_text = f"-----BEGIN PRIVATE KEY-----\n{key_text}\n-----END PRIVATE KEY-----"
         
         await state.update_data(ssh_key=key_text)
         await state.set_state(AdminAddServerStates.waiting_for_connection)
-        await message.answer("✅ Файл с SSH ключом успешно загружен!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
+        await message.answer(
+            "✅ Файл с SSH ключом успешно загружен!\n\n"
+            "Введите строку подключения в формате:\n"
+            "<code>user@host</code> или <code>user@host:port</code>\n\n"
+            "Пример: <code>opc@193.122.8.29</code>",
+            reply_markup=back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
         
     except Exception as e:
         await message.answer(f"❌ Ошибка загрузки файла: {str(e)}")
+
+# Обработчик для текста когда ожидается файл - перенаправляем
+@dp.message(AdminAddServerStates.waiting_for_key)
+async def process_wrong_input_in_key_state(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.clear()
+        await message.answer("🖥️ <b>Управление серверами</b>", reply_markup=servers_menu(), parse_mode=ParseMode.HTML)
+        return
+    
+    await message.answer("❌ Пожалуйста, отправьте ФАЙЛ с SSH ключом (.key, .pem, .txt)")
 
 @dp.message(AdminAddServerStates.waiting_for_connection)
 async def process_connection_string(message: Message, state: FSMContext):
@@ -514,38 +511,13 @@ async def process_connection_string(message: Message, state: FSMContext):
             server_id = cursor.lastrowid
             await db.commit()
         
-        # Тестируем подключение
-        await message.answer("🔍 Тестирую SSH подключение...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "echo 'SSH Test OK' && whoami", timeout=30)
-        
-        if success:
-            await db.execute(
-                "UPDATE servers SET is_active = TRUE WHERE id = ?",
-                (server_id,)
-            )
-            await db.commit()
-            
-            await message.answer(
-                f"✅ Сервер '{data['server_name']}' успешно добавлен!\n\n"
-                f"SSH подключение: ✅ Работает\n"
-                f"Пользователь: {stdout.strip().split()[-1] if stdout else 'N/A'}\n"
-                f"Строка подключения: {conn_str}\n\n"
-                f"ID сервера: {server_id}\n\n"
-                f"Теперь можно установить WireGuard через меню серверов.",
-                reply_markup=admin_main_menu()
-            )
-        else:
-            # Помечаем как неактивный
-            await db.execute("UPDATE servers SET is_active = FALSE WHERE id = ?", (server_id,))
-            await db.commit()
-            
-            await message.answer(
-                f"⚠️ Сервер добавлен, но SSH не работает:\n\n"
-                f"Ошибка: {stderr}\n\n"
-                f"ID сервера: {server_id}\n"
-                f"Проверьте настройки подключения.",
-                reply_markup=admin_main_menu()
-            )
+        await message.answer(
+            f"✅ Сервер '{data['server_name']}' добавлен в базу!\n\n"
+            f"ID сервера: {server_id}\n"
+            f"Строка подключения: {conn_str}\n\n"
+            f"Теперь можно установить WireGuard через меню серверов.",
+            reply_markup=admin_main_menu()
+        )
         
         await state.clear()
         
@@ -981,7 +953,7 @@ async def process_test_bot_token(message: Message, state: FSMContext):
 
 # Обработчики действий с сервером (ID из текста)
 @dp.message(F.text.contains("Установить WG (ID:"))
-async def handle_install_wg(message: Message, state: FSMContext):
+async def handle_install_wg(message: Message):
     if not is_admin(message.from_user.id, message.chat.id):
         return
     
@@ -1040,7 +1012,7 @@ async def handle_install_wg(message: Message, state: FSMContext):
         )
 
 @dp.message(F.text.contains("Проверить SSH (ID:"))
-async def handle_check_ssh(message: Message, state: FSMContext):
+async def handle_check_ssh(message: Message):
     if not is_admin(message.from_user.id, message.chat.id):
         return
     
