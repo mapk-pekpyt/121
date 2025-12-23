@@ -1,4 +1,4 @@
-# main.py - УПРОЩЕННЫЙ И ИСПРАВЛЕННЫЙ КОД
+# main.py - ИСПРАВЛЕННЫЙ КОД (без синтаксических ошибок)
 import os
 import asyncio
 import logging
@@ -305,7 +305,8 @@ async def setup_wireguard_server(server_id: int, message: Message = None):
         await log_step("Проверяю операционную систему...")
         stdout, stderr, success = await execute_ssh_command(server_id, "cat /etc/os-release | grep PRETTY_NAME")
         if success and stdout:
-            await log_step(f"Система: {stdout.split('=')[1].strip('\"')}")
+            os_info = stdout.split('=')[1].strip('"')
+            await log_step(f"Система: {os_info}")
         
         # 3. Установка WireGuard
         await log_step("Обновляю пакеты системы...")
@@ -401,7 +402,7 @@ async def setup_wireguard_server(server_id: int, message: Message = None):
             )
             await db.commit()
         
-        await log_step(f"✅ WireGuard успешно настроен!")
+        await log_step("✅ WireGuard успешно настроен!")
         await log_step(f"Публичный ключ: {public_key[:30]}...")
         await log_step(f"IP сервера: {server_ip}")
         
@@ -476,9 +477,9 @@ async def create_wireguard_client(server_id: int, user_id: int, message: Message
         
         if success and 'not exists' in stdout:
             # Создаем базовый конфиг
-            config_cmd = f"""
+            config_cmd = """
             cd /etc/wireguard
-            cat > wg0.conf << EOF
+            cat > wg0.conf << 'EOF'
 [Interface]
 Address = 10.0.0.1/24
 ListenPort = 51820
@@ -493,7 +494,7 @@ EOF
         # 6. Добавляем пира в конфиг
         add_peer_cmd = f"""
         cd /etc/wireguard
-        cat >> wg0.conf << EOF
+        cat >> wg0.conf << 'EOF'
 
 [Peer]
 # Client {user_id}
@@ -699,7 +700,7 @@ async def cmd_ping(message: types.Message):
     await message.answer("🏓 Pong!")
     end_time = time.time()
     response_time = round((end_time - start_time) * 1000, 2)
-    await message.answer(f"⏱️ Время ответа: {response_time}ms")
+    await message.answer(f"⏱️ Время ответа: {{response_time}}ms")
 
 @dp.message()
 async def echo(message: types.Message):
@@ -719,22 +720,20 @@ if __name__ == "__main__":
         await execute_ssh_command(server_id, "mkdir -p /tmp/test_bot")
         
         # Создаем bot.py
-        create_bot_cmd = f"cd /tmp/test_bot && echo '''{bot_content}''' > bot.py"
+        create_bot_cmd = f"cd /tmp/test_bot && cat > bot.py << 'EOF'\n{bot_content}\nEOF"
         await execute_ssh_command(server_id, create_bot_cmd)
         
         # Создаем requirements.txt
         await execute_ssh_command(server_id, "cd /tmp/test_bot && echo 'aiogram>=3.0.0' > requirements.txt")
         
         # 4. Создаем Dockerfile
-        dockerfile = """
-FROM python:3.11-slim
+        dockerfile = """FROM python:3.11-slim
 WORKDIR /app
 COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
-CMD ["python", "bot.py"]
-"""
+CMD ["python", "bot.py"]"""
         
-        create_dockerfile = f"cd /tmp/test_bot && echo '''{dockerfile}''' > Dockerfile"
+        create_dockerfile = "cd /tmp/test_bot && cat > Dockerfile << 'EOF'\n" + dockerfile + "\nEOF"
         await execute_ssh_command(server_id, create_dockerfile)
         
         # 5. Собираем и запускаем контейнер
@@ -749,13 +748,14 @@ CMD ["python", "bot.py"]
         
         if success and stdout:
             container_id = stdout.strip()[:12]
-            await message.answer(f"✅ Тестовый бот запущен!\n\n🆔 Контейнер: {container_id}")
+            await message.answer(f"✅ Тестовый бот запущен!\\n\\n🆔 Контейнер: {container_id}")
             
             # Получаем логи
             await asyncio.sleep(2)
             stdout, stderr, success = await execute_ssh_command(server_id, "docker logs test_bot --tail 10")
             if success:
-                await message.answer(f"📋 Логи запуска:\n<code>{stdout[-500:] if stdout else 'Нет логов'}</code>", parse_mode=ParseMode.HTML)
+                logs = stdout[-500:] if stdout else 'Нет логов'
+                await message.answer(f"📋 Логи запуска:\\n<code>{logs}</code>", parse_mode=ParseMode.HTML)
             
             return True, "Бот успешно создан и запущен"
         else:
@@ -1569,7 +1569,6 @@ async def process_test_server(message: Message, state: FSMContext):
             server_id = int(match.group(1))
         else:
             # Ищем цифры в тексте
-            import re
             numbers = re.findall(r'\d+', message.text)
             if numbers:
                 server_id = int(numbers[-1])
