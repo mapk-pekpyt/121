@@ -1,4 +1,4 @@
-# main.py - ИСПРАВЛЕННАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ ФАЙЛОВ
+# main.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
 import os
 import asyncio
 import logging
@@ -7,6 +7,7 @@ import random
 import qrcode
 import io
 import sqlite3
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -71,11 +72,15 @@ async def init_database():
                     user_id INTEGER NOT NULL,
                     username TEXT,
                     server_id INTEGER,
+                    client_name TEXT,
+                    client_public_key TEXT,
+                    client_ip TEXT,
                     config_data TEXT,
                     subscription_end TIMESTAMP,
                     trial_used BOOLEAN DEFAULT FALSE,
                     is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (server_id) REFERENCES servers (id) ON DELETE SET NULL
                 )
             """)
             
@@ -186,6 +191,83 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 60, u
     except Exception as e:
         return "", f"Общая ошибка: {str(e)}", False
 
+async def setup_wireguard_via_git(server_id: int, git_repo: str, message: Message):
+    """Ручная установка WireGuard через Git"""
+    await message.answer(f"🔄 Устанавливаю WireGuard через Git репозиторий: {git_repo}")
+    
+    commands = [
+        "apt-get update -y",
+        "apt-get install -y git build-essential libmnl-dev libelf-dev linux-headers-$(uname -r) pkg-config",
+        f"cd /tmp && git clone {git_repo}",
+        "cd /tmp/wireguard-linux-compat && make && make install",
+        "cd /tmp && git clone https://git.zx2c4.com/wireguard-tools",
+        "cd /tmp/wireguard-tools/src && make && make install",
+        "modprobe wireguard && echo 'wireguard' >> /etc/modules-load.d/wireguard.conf",
+        "systemctl enable wg-quick@wg0 2>/dev/null || true"
+    ]
+    
+    for cmd in commands:
+        await message.answer(f"Выполняю: {cmd[:50]}...")
+        stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=120, use_sudo=True)
+        
+        if not success:
+            await message.answer(f"❌ Ошибка: {stderr[:200]}")
+            return False
+    
+    # Генерация ключей
+    keygen_cmd = """
+    cd /etc/wireguard
+    umask 077
+    wg genkey | tee private.key | wg pubkey > public.key
+    echo "Ключи сгенерированы"
+    """
+    
+    stdout, stderr, success = await execute_ssh_command(server_id, keygen_cmd, use_sudo=True)
+    
+    if success and "Ключи сгенерированы" in stdout:
+        await message.answer("✅ WireGuard успешно установлен через Git!")
+        return True
+    else:
+        await message.answer(f"❌ Ошибка генерации ключей: {stderr}")
+        return False
+
+async def remove_vpn_user_from_server(server_id: int, client_name: str, message: Message = None):
+    """Удаляет пользователя VPN с сервера"""
+    try:
+        # Получаем информацию о правах
+        stdout, stderr, success = await execute_ssh_command(server_id, "sudo -n true 2>&1 || echo 'No sudo'")
+        has_sudo = success and 'No sudo' not in stdout + stderr
+        
+        if has_sudo:
+            remove_cmd = f"""
+            cd /etc/wireguard
+            sudo wg set wg0 peer $(sudo cat {client_name}.public) remove
+            sudo rm -f {client_name}.private {client_name}.public
+            sudo wg-quick save wg0 2>/dev/null || true
+            """
+        else:
+            remove_cmd = f"""
+            cd ~/.wireguard
+            wg set wg0 peer $(cat {client_name}.public) remove 2>/dev/null || true
+            rm -f {client_name}.private {client_name}.public
+            """
+        
+        stdout, stderr, success = await execute_ssh_command(server_id, remove_cmd, use_sudo=False)
+        
+        # Обновляем счетчик пользователей
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE servers SET current_users = current_users - 1 WHERE id = ? AND current_users > 0", (server_id,))
+            await db.commit()
+        
+        if message:
+            await message.answer(f"✅ Пользователь {client_name} удален с сервера")
+        
+        return True
+    except Exception as e:
+        if message:
+            await message.answer(f"❌ Ошибка удаления пользователя: {str(e)}")
+        return False
+
 # ========== КЛАВИАТУРЫ ==========
 def user_main_menu():
     buttons = [
@@ -208,6 +290,7 @@ def servers_menu():
     buttons = [
         [types.KeyboardButton(text="📋 Список серверов")],
         [types.KeyboardButton(text="➕ Добавить сервер")],
+        [types.KeyboardButton(text="🔧 Ручная установка WG")],
         [types.KeyboardButton(text="◀️ Назад")]
     ]
     return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -216,6 +299,7 @@ def admin_users_menu():
     buttons = [
         [types.KeyboardButton(text="🎁 Выдать VPN")],
         [types.KeyboardButton(text="📋 Список пользователей")],
+        [types.KeyboardButton(text="🚫 Отключить VPN")],
         [types.KeyboardButton(text="◀️ Назад")]
     ]
     return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -252,6 +336,13 @@ class AdminTestBotStates(StatesGroup):
     waiting_for_server = State()
     waiting_for_token = State()
 
+class AdminManualWGStates(StatesGroup):
+    waiting_for_server = State()
+    waiting_for_git_repo = State()
+
+class AdminRemoveVPNStates(StatesGroup):
+    waiting_for_user = State()
+
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -283,7 +374,7 @@ async def admin_list_servers(message: Message):
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, name, is_active, wireguard_configured FROM servers ORDER BY name")
+            cursor = await db.execute("SELECT id, name, is_active, wireguard_configured, current_users, max_users FROM servers ORDER BY name")
             servers = await cursor.fetchall()
     except Exception as e:
         await message.answer("❌ Ошибка получения данных")
@@ -295,10 +386,11 @@ async def admin_list_servers(message: Message):
     
     text = "📋 <b>Список серверов:</b>\n\n"
     for server in servers:
-        server_id, name, active, wg_configured = server
+        server_id, name, active, wg_configured, current_users, max_users = server
         status = "🟢" if active else "🔴"
         wg_status = "🔐" if wg_configured else "❌"
-        text += f"{status}{wg_status} <b>{name}</b> (ID: {server_id})\n"
+        users = f"👥 {current_users}/{max_users}"
+        text += f"{status}{wg_status} <b>{name}</b> (ID: {server_id}) {users}\n"
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=servers_menu())
 
@@ -321,8 +413,8 @@ async def process_server_name(message: Message, state: FSMContext):
     await state.set_state(AdminAddServerStates.waiting_for_key)
     await message.answer(
         "Отправьте приватный SSH ключ:\n\n"
-        "📎 <b>Пришлите файл с ключом</b> (формат .key, .pem) или\n"
-        "📝 <b>Вставьте текст ключа</b> (начинается с -----BEGIN PRIVATE KEY-----)",
+        "📎 <b>Пришлите файл с ключом</b> (формат .key, .pem) ИЛИ\n"
+        "📝 <b>Вставьте текст ключа</b> (начинается с -----BEGIN)",
         reply_markup=back_keyboard(),
         parse_mode=ParseMode.HTML
     )
@@ -336,57 +428,57 @@ async def process_ssh_key_text(message: Message, state: FSMContext):
         return
     
     # Проверяем, похож ли текст на SSH ключ
-    if '-----BEGIN' in message.text and '-----END' in message.text:
-        await state.update_data(ssh_key=message.text)
+    text = message.text.strip()
+    if '-----BEGIN' in text and '-----END' in text:
+        await state.update_data(ssh_key=text)
         await state.set_state(AdminAddServerStates.waiting_for_connection)
         await message.answer("✅ Ключ принят!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
     else:
-        await message.answer("❌ Это не похоже на SSH ключ. Отправьте файл с ключом или текст ключа (начинается с -----BEGIN PRIVATE KEY-----):")
+        await message.answer("❌ Это не похоже на SSH ключ. Отправьте файл с ключом (.key) или текст ключа:")
 
 # Обработчик для файлов с ключами
 @dp.message(AdminAddServerStates.waiting_for_key, F.document)
-async def process_ssh_key_file(message: Message, state: FSMContext, bot: Bot):
-    # Проверяем, что это файл с ключом
+async def process_ssh_key_file(message: Message, state: FSMContext):
     if not message.document:
         await message.answer("❌ Пожалуйста, отправьте файл с SSH ключом")
         return
     
-    # Получаем файл
-    file_id = message.document.file_id
+    # Проверяем расширение файла
+    file_name = message.document.file_name or ""
+    if not file_name.endswith(('.key', '.pem', '.txt')):
+        await message.answer("❌ Файл должен быть с расширением .key, .pem или .txt")
+        return
+    
+    await message.answer("📥 Загружаю файл...")
+    
     try:
-        # Скачиваем файл
-        file = await bot.get_file(file_id)
+        # Получаем файл
+        file = await bot.get_file(message.document.file_id)
         file_path = file.file_path
         
-        # Скачиваем содержимое
+        # Скачиваем файл
         downloaded_file = await bot.download_file(file_path)
-        file_content = downloaded_file.read().decode('utf-8')
+        file_content = downloaded_file.read()
+        
+        # Пробуем декодировать как UTF-8
+        try:
+            key_text = file_content.decode('utf-8')
+        except UnicodeDecodeError:
+            # Пробуем другие кодировки
+            try:
+                key_text = file_content.decode('latin-1')
+            except:
+                key_text = file_content.decode('utf-8', errors='ignore')
         
         # Проверяем, что это SSH ключ
-        if '-----BEGIN' not in file_content or '-----END' not in file_content:
-            await message.answer("❌ Файл не содержит SSH ключ. Ключ должен начинаться с -----BEGIN PRIVATE KEY-----")
+        if '-----BEGIN' not in key_text:
+            await message.answer("❌ Файл не содержит SSH ключ в PEM формате")
             return
         
-        await state.update_data(ssh_key=file_content)
+        await state.update_data(ssh_key=key_text)
         await state.set_state(AdminAddServerStates.waiting_for_connection)
         await message.answer("✅ Файл с SSH ключом успешно загружен!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
         
-    except UnicodeDecodeError:
-        # Если не UTF-8, пробуем как бинарный
-        try:
-            downloaded_file = await bot.download_file(file_path)
-            file_content = downloaded_file.read().decode('utf-8', errors='ignore')
-            
-            if '-----BEGIN' not in file_content or '-----END' not in file_content:
-                await message.answer("❌ Не удалось прочитать SSH ключ из файла")
-                return
-            
-            await state.update_data(ssh_key=file_content)
-            await state.set_state(AdminAddServerStates.waiting_for_connection)
-            await message.answer("✅ Файл с SSH ключом загружен!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
-            
-        except Exception as e:
-            await message.answer(f"❌ Ошибка чтения файла: {str(e)}")
     except Exception as e:
         await message.answer(f"❌ Ошибка загрузки файла: {str(e)}")
 
@@ -406,60 +498,162 @@ async def process_connection_string(message: Message, state: FSMContext):
         return
     
     try:
-        # Проверяем формат строки подключения
         conn_str = message.text.strip()
+        
+        # Проверяем формат
         if '@' not in conn_str:
             await message.answer("❌ Неверный формат. Используйте: user@host или user@host:port")
             return
         
-        # Тестируем подключение перед сохранением
+        # Сохраняем в базу данных
         async with aiosqlite.connect(DB_PATH) as db:
-            # Сохраняем временно для теста
-            temp_id = await db.execute_insert(
+            cursor = await db.execute(
                 "INSERT INTO servers (name, ssh_key, connection_string) VALUES (?, ?, ?)",
                 (data['server_name'], data['ssh_key'], conn_str)
             )
+            server_id = cursor.lastrowid
+            await db.commit()
+        
+        # Тестируем подключение
+        await message.answer("🔍 Тестирую SSH подключение...")
+        stdout, stderr, success = await execute_ssh_command(server_id, "echo 'SSH Test OK' && whoami", timeout=30)
+        
+        if success:
+            await db.execute(
+                "UPDATE servers SET is_active = TRUE WHERE id = ?",
+                (server_id,)
+            )
             await db.commit()
             
-            # Тестируем SSH подключение
-            await message.answer("🔍 Тестирую SSH подключение...")
-            stdout, stderr, success = await execute_ssh_command(temp_id, "echo 'SSH Test OK'", timeout=30)
+            await message.answer(
+                f"✅ Сервер '{data['server_name']}' успешно добавлен!\n\n"
+                f"SSH подключение: ✅ Работает\n"
+                f"Пользователь: {stdout.strip().split()[-1] if stdout else 'N/A'}\n"
+                f"Строка подключения: {conn_str}\n\n"
+                f"ID сервера: {server_id}\n\n"
+                f"Теперь можно установить WireGuard через меню серверов.",
+                reply_markup=admin_main_menu()
+            )
+        else:
+            # Помечаем как неактивный
+            await db.execute("UPDATE servers SET is_active = FALSE WHERE id = ?", (server_id,))
+            await db.commit()
             
-            if success:
-                # Обновляем статус
-                await db.execute(
-                    "UPDATE servers SET is_active = TRUE WHERE id = ?",
-                    (temp_id,)
-                )
-                await db.commit()
-                
-                await state.clear()
-                await message.answer(
-                    f"✅ Сервер '{data['server_name']}' успешно добавлен!\n\n"
-                    f"SSH подключение: ✅ Работает\n"
-                    f"Строка подключения: {conn_str}",
-                    reply_markup=admin_main_menu()
-                )
-            else:
-                # Удаляем сервер если не подключились
-                await db.execute("DELETE FROM servers WHERE id = ?", (temp_id,))
-                await db.commit()
-                
-                await message.answer(
-                    f"❌ Не удалось подключиться к серверу:\n\n"
-                    f"Ошибка: {stderr}\n\n"
-                    f"Проверьте:\n"
-                    f"1. Правильность SSH ключа\n"
-                    f"2. Доступность сервера\n"
-                    f"3. Настройки firewall\n"
-                    f"4. Порт SSH (по умолчанию 22)",
-                    reply_markup=servers_menu()
-                )
-                await state.clear()
-                
+            await message.answer(
+                f"⚠️ Сервер добавлен, но SSH не работает:\n\n"
+                f"Ошибка: {stderr}\n\n"
+                f"ID сервера: {server_id}\n"
+                f"Проверьте настройки подключения.",
+                reply_markup=admin_main_menu()
+            )
+        
+        await state.clear()
+        
     except Exception as e:
         await message.answer(f"❌ Ошибка добавления сервера: {str(e)}", reply_markup=admin_main_menu())
         await state.clear()
+
+@dp.message(F.text == "🔧 Ручная установка WG")
+async def admin_manual_wg_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id):
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id, name FROM servers WHERE is_active = TRUE LIMIT 10")
+            servers = await cursor.fetchall()
+    except:
+        await message.answer("❌ Ошибка получения данных")
+        return
+    
+    if not servers:
+        await message.answer("📭 Нет активных серверов")
+        return
+    
+    text = "🔧 <b>Ручная установка WireGuard через Git</b>\n\n"
+    text += "Доступные серверы:\n"
+    for server_id, name in servers:
+        text += f"ID: {server_id} - {name}\n"
+    
+    text += "\nВведите ID сервера для установки:"
+    
+    await state.set_state(AdminManualWGStates.waiting_for_server)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+@dp.message(AdminManualWGStates.waiting_for_server)
+async def process_manual_wg_server(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.clear()
+        await message.answer("🖥️ <b>Управление серверами</b>", reply_markup=servers_menu(), parse_mode=ParseMode.HTML)
+        return
+    
+    try:
+        server_id = int(message.text)
+        
+        # Проверяем существование сервера
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT name FROM servers WHERE id = ?", (server_id,))
+            server = await cursor.fetchone()
+            
+            if not server:
+                await message.answer("❌ Сервер не найден")
+                return
+            
+            server_name = server[0]
+        
+        await state.update_data(server_id=server_id, server_name=server_name)
+        await state.set_state(AdminManualWGStates.waiting_for_git_repo)
+        
+        await message.answer(
+            f"🔧 <b>Ручная установка на {server_name}</b>\n\n"
+            f"Введите URL Git репозитория WireGuard (или оставьте пустым для стандартного):\n"
+            f"Пример: https://git.zx2c4.com/wireguard-linux-compat",
+            reply_markup=back_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+    except ValueError:
+        await message.answer("Введите числовой ID сервера:")
+
+@dp.message(AdminManualWGStates.waiting_for_git_repo)
+async def process_git_repo(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.clear()
+        await message.answer("🖥️ <b>Управление серверами</b>", reply_markup=servers_menu(), parse_mode=ParseMode.HTML)
+        return
+    
+    data = await state.get_data()
+    server_id = data['server_id']
+    server_name = data['server_name']
+    
+    git_repo = message.text.strip()
+    if not git_repo:
+        git_repo = "https://git.zx2c4.com/wireguard-linux-compat"
+    
+    # Запускаем установку
+    success = await setup_wireguard_via_git(server_id, git_repo, message)
+    
+    if success:
+        # Обновляем статус в БД
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE servers SET wireguard_configured = TRUE WHERE id = ?",
+                (server_id,)
+            )
+            await db.commit()
+        
+        await message.answer(
+            f"✅ WireGuard успешно установлен на {server_name}!\n\n"
+            f"Сервер готов к созданию VPN подключений.",
+            reply_markup=admin_main_menu()
+        )
+    else:
+        await message.answer(
+            f"❌ Не удалось установить WireGuard на {server_name}\n\n"
+            f"Проверьте логи и права доступа.",
+            reply_markup=admin_main_menu()
+        )
+    
+    await state.clear()
 
 @dp.message(F.text == "👤 Пользователи")
 async def admin_users(message: Message, state: FSMContext):
@@ -474,7 +668,7 @@ async def admin_gift_vpn_start(message: Message, state: FSMContext):
         return
     
     await state.set_state(AdminUserStates.waiting_for_username)
-    await message.answer("Введите username пользователя (с @ или без):", reply_markup=back_keyboard())
+    await message.answer("Введите username пользователя (с @ или без) или user_id:", reply_markup=back_keyboard())
 
 @dp.message(AdminUserStates.waiting_for_username)
 async def process_username(message: Message, state: FSMContext):
@@ -483,10 +677,19 @@ async def process_username(message: Message, state: FSMContext):
         await message.answer("👤 <b>Управление пользователями</b>", reply_markup=admin_users_menu(), parse_mode=ParseMode.HTML)
         return
     
-    username = message.text.replace('@', '')
+    username = message.text.replace('@', '').strip()
     await state.update_data(username=username)
     await state.set_state(AdminUserStates.waiting_for_period)
-    await message.answer("Выберите период:\n1. 3 дня (пробный)\n2. 7 дней\n3. 30 дней\n\nВведите номер:", reply_markup=back_keyboard())
+    
+    prices = await get_vpn_prices()
+    
+    text = "Выберите период:\n"
+    text += "1. 3 дня (пробный)\n"
+    text += f"2. 7 дней ({prices['week']['stars']} Stars)\n"
+    text += f"3. 30 дней ({prices['month']['stars']} Stars)\n\n"
+    text += "Введите номер:"
+    
+    await message.answer(text, reply_markup=back_keyboard())
 
 @dp.message(AdminUserStates.waiting_for_period)
 async def process_gift_period(message: Message, state: FSMContext):
@@ -506,41 +709,79 @@ async def process_gift_period(message: Message, state: FSMContext):
     days = period_map[message.text]
     
     try:
-        # Находим доступный сервер
+        # Определяем user_id (если username это число, считаем это user_id)
+        user_id = 0
+        if username.isdigit():
+            user_id = int(username)
+            username_to_save = f"id_{username}"
+        else:
+            username_to_save = username
+        
+        # Находим доступный сервер с WireGuard
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id FROM servers WHERE wireguard_configured = TRUE LIMIT 1")
+            cursor = await db.execute("""
+                SELECT id, name, current_users, max_users 
+                FROM servers 
+                WHERE wireguard_configured = TRUE 
+                AND is_active = TRUE
+                AND current_users < max_users
+                LIMIT 1
+            """)
             server = await cursor.fetchone()
             
             if not server:
                 await message.answer("❌ Нет доступных серверов с настроенным WireGuard")
                 return
             
-            server_id = server[0]
+            server_id, server_name, current_users, max_users = server
+            
+            # Создаем клиента
+            client_name = f"client_{user_id if user_id > 0 else username_to_save}_{random.randint(1000, 9999)}"
+            subscription_end = (datetime.now() + timedelta(days=days)).isoformat()
             
             # Сохраняем пользователя
             await db.execute("""
-                INSERT INTO vpn_users (user_id, username, server_id, subscription_end, trial_used, is_active)
-                VALUES (?, ?, ?, ?, ?, TRUE)
-            """, (0, username, server_id, (datetime.now() + timedelta(days=days)).isoformat(), days == 3))
+                INSERT INTO vpn_users (user_id, username, server_id, client_name, subscription_end, trial_used, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, TRUE)
+            """, (user_id, username_to_save, server_id, client_name, subscription_end, days == 3))
+            
+            # Обновляем счетчик пользователей на сервере
+            await db.execute(
+                "UPDATE servers SET current_users = current_users + 1 WHERE id = ?",
+                (server_id,)
+            )
             
             await db.commit()
         
         await state.clear()
-        await message.answer(f"✅ Пользователю @{username} выдано VPN на {days} дней!", reply_markup=admin_main_menu())
+        await message.answer(
+            f"✅ VPN успешно выдан!\n\n"
+            f"👤 Пользователь: @{username}\n"
+            f"📅 Период: {days} дней\n"
+            f"🖥️ Сервер: {server_name}\n"
+            f"👥 Место: {current_users + 1}/{max_users}\n"
+            f"🔑 Имя клиента: {client_name}\n\n"
+            f"Действует до: {datetime.fromisoformat(subscription_end).strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=admin_main_menu()
+        )
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=admin_main_menu())
 
 @dp.message(F.text == "📋 Список пользователей")
-async def admin_list_users(message: Message):
+async def admin_list_users(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id, message.chat.id):
         return
+    
+    await state.clear()
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""
-                SELECT user_id, username, subscription_end, is_active 
-                FROM vpn_users 
-                ORDER BY subscription_end DESC 
+                SELECT v.id, v.user_id, v.username, v.client_name, v.subscription_end, 
+                       v.is_active, s.name as server_name
+                FROM vpn_users v
+                LEFT JOIN servers s ON v.server_id = s.id
+                ORDER BY v.subscription_end DESC 
                 LIMIT 50
             """)
             users = await cursor.fetchall()
@@ -552,19 +793,87 @@ async def admin_list_users(message: Message):
         await message.answer("📭 Пользователей нет", reply_markup=admin_users_menu())
         return
     
-    text = "📋 <b>Последние пользователи:</b>\n\n"
-    for user in users:
-        user_id, username, sub_end, active = user
+    text = "📋 <b>Список пользователей VPN:</b>\n\n"
+    for i, user in enumerate(users[:20], 1):
+        user_id, tg_id, username, client_name, sub_end, active, server_name = user
         status = "🟢" if active else "🔴"
-        username_display = f"@{username}" if username else f"ID:{user_id}"
+        username_display = f"@{username}" if username else f"ID:{tg_id}"
         
         if sub_end:
-            sub_date = datetime.fromisoformat(sub_end).strftime('%d.%m.%Y')
-            text += f"{status} {username_display} - до {sub_date}\n"
+            sub_date = datetime.fromisoformat(sub_end).strftime('%d.%m')
+            days_left = (datetime.fromisoformat(sub_end) - datetime.now()).days
+            text += f"{i}. {status} {username_display}"
+            if client_name:
+                text += f" [{client_name}]"
+            text += f"\n   📅 до {sub_date} ({days_left}д) | 🖥️ {server_name or 'N/A'}\n"
         else:
-            text += f"{status} {username_display} - нет подписки\n"
+            text += f"{i}. {status} {username_display}\n   📅 нет подписки\n"
     
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=admin_users_menu())
+    if len(users) > 20:
+        text += f"\n... и еще {len(users) - 20} пользователей"
+    
+    text += "\n\nДля отключения VPN введите номер пользователя из списка:"
+    
+    await state.set_state(AdminRemoveVPNStates.waiting_for_user)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+@dp.message(AdminRemoveVPNStates.waiting_for_user)
+async def process_remove_vpn_user(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.clear()
+        await message.answer("👤 <b>Управление пользователей</b>", reply_markup=admin_users_menu(), parse_mode=ParseMode.HTML)
+        return
+    
+    try:
+        user_num = int(message.text) - 1
+        
+        # Получаем список пользователей
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT v.id, v.user_id, v.username, v.client_name, v.server_id
+                FROM vpn_users v
+                WHERE v.is_active = TRUE
+                ORDER BY v.subscription_end DESC 
+                LIMIT 50
+            """)
+            users = await cursor.fetchall()
+        
+        if user_num < 0 or user_num >= len(users):
+            await message.answer("❌ Неверный номер пользователя")
+            return
+        
+        user_id, tg_id, username, client_name, server_id = users[user_num]
+        
+        # Удаляем с сервера
+        if client_name and server_id:
+            success = await remove_vpn_user_from_server(server_id, client_name, message)
+        else:
+            success = True
+        
+        # Деактивируем в БД
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE vpn_users SET is_active = FALSE WHERE id = ?",
+                (user_id,)
+            )
+            await db.commit()
+        
+        await state.clear()
+        await message.answer(
+            f"✅ VPN отключен для пользователя @{username}!\n\n"
+            f"Пользователь деактивирован в системе.",
+            reply_markup=admin_main_menu()
+        )
+        
+    except ValueError:
+        await message.answer("Введите номер пользователя из списка:")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=admin_main_menu())
+        await state.clear()
+
+@dp.message(F.text == "🚫 Отключить VPN")
+async def admin_disable_vpn_start(message: Message, state: FSMContext):
+    await admin_list_users(message, state)
 
 @dp.message(F.text == "💰 Цены")
 async def admin_prices(message: Message, state: FSMContext):
@@ -615,14 +924,14 @@ async def admin_test_server(message: Message, state: FSMContext):
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, name FROM servers LIMIT 10")
+            cursor = await db.execute("SELECT id, name FROM servers WHERE is_active = TRUE LIMIT 10")
             servers = await cursor.fetchall()
     except:
         await message.answer("❌ Ошибка получения данных")
         return
     
     if not servers:
-        await message.answer("📭 Серверов нет для тестирования")
+        await message.answer("📭 Нет активных серверов для тестирования")
         return
     
     text = "🤖 <b>Тест сервера ботом</b>\n\n"
@@ -663,21 +972,19 @@ async def process_test_bot_token(message: Message, state: FSMContext):
     await state.clear()
     
     # Простая проверка SSH
-    stdout, stderr, success = await execute_ssh_command(server_id, "echo 'Test' && whoami", timeout=30)
+    stdout, stderr, success = await execute_ssh_command(server_id, "echo 'Test' && whoami && uname -a", timeout=30)
     
     if success:
-        await message.answer(f"✅ SSH подключение работает!\n\nОтвет сервера:\n{stdout}", 
-                           reply_markup=admin_main_menu())
+        await message.answer(f"✅ SSH подключение работает!\n\n{stdout}", reply_markup=admin_main_menu())
     else:
         await message.answer(f"❌ SSH ошибка: {stderr}", reply_markup=admin_main_menu())
 
 # Обработчики действий с сервером (ID из текста)
-@dp.message(F.text.contains("ID:"))
-async def handle_server_action(message: Message, state: FSMContext):
+@dp.message(F.text.contains("Установить WG (ID:"))
+async def handle_install_wg(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id, message.chat.id):
         return
     
-    import re
     match = re.search(r'ID:\s*(\d+)', message.text)
     if not match:
         return
@@ -697,28 +1004,83 @@ async def handle_server_action(message: Message, state: FSMContext):
         await message.answer("❌ Ошибка получения данных")
         return
     
-    if "🔧 Установить WG" in message.text:
-        await message.answer(f"🔄 Устанавливаю WireGuard на {server_name}...")
-        stdout, stderr, success = await execute_ssh_command(
-            server_id, 
-            "apt-get update && apt-get install -y wireguard wireguard-tools 2>&1",
-            timeout=180,
-            use_sudo=True
-        )
-        
-        if success:
-            await message.answer(f"✅ WireGuard установлен на {server_name}!", reply_markup=admin_main_menu())
-        else:
-            await message.answer(f"❌ Ошибка установки: {stderr[:500]}", reply_markup=admin_main_menu())
+    await message.answer(f"🔄 Устанавливаю WireGuard на {server_name}...")
     
-    elif "🔍 Проверить SSH" in message.text:
-        await message.answer(f"🔍 Проверяю SSH подключение к {server_name}...")
-        stdout, stderr, success = await execute_ssh_command(server_id, "echo 'SSH Test OK' && uname -a")
+    # Команды для установки WireGuard
+    commands = [
+        "apt-get update -y",
+        "apt-get install -y wireguard wireguard-tools 2>&1 || apt-get install -y wireguard 2>&1",
+        "systemctl enable wg-quick@wg0 2>/dev/null || true",
+        "modprobe wireguard 2>/dev/null || true"
+    ]
+    
+    all_success = True
+    for cmd in commands:
+        stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=120, use_sudo=True)
         
-        if success:
-            await message.answer(f"✅ SSH работает!\n\n{stdout}", reply_markup=admin_main_menu())
-        else:
-            await message.answer(f"❌ SSH ошибка: {stderr}", reply_markup=admin_main_menu())
+        if not success:
+            await message.answer(f"⚠️ Ошибка: {stderr[:200]}")
+            all_success = False
+    
+    if all_success:
+        # Помечаем как настроенный
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE servers SET wireguard_configured = TRUE WHERE id = ?",
+                (server_id,)
+            )
+            await db.commit()
+        
+        await message.answer(f"✅ WireGuard установлен на {server_name}!", reply_markup=admin_main_menu())
+    else:
+        await message.answer(
+            f"⚠️ Установка WireGuard на {server_name} завершена с ошибками.\n"
+            f"Попробуйте ручную установку через Git.",
+            reply_markup=admin_main_menu()
+        )
+
+@dp.message(F.text.contains("Проверить SSH (ID:"))
+async def handle_check_ssh(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id):
+        return
+    
+    match = re.search(r'ID:\s*(\d+)', message.text)
+    if not match:
+        return
+    
+    server_id = int(match.group(1))
+    
+    # Получаем информацию о сервере
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT name FROM servers WHERE id = ?", (server_id,))
+            server = await cursor.fetchone()
+            if not server:
+                await message.answer("❌ Сервер не найден")
+                return
+            server_name = server[0]
+    except:
+        await message.answer("❌ Ошибка получения данных")
+        return
+    
+    await message.answer(f"🔍 Проверяю SSH подключение к {server_name}...")
+    stdout, stderr, success = await execute_ssh_command(server_id, "echo 'SSH Test OK' && whoami && uname -a && date")
+    
+    if success:
+        lines = stdout.strip().split('\n')
+        response = f"✅ SSH работает!\n\n"
+        if len(lines) > 0:
+            response += f"{lines[0]}\n"
+        if len(lines) > 1:
+            response += f"Пользователь: {lines[1]}\n"
+        if len(lines) > 2:
+            response += f"Система: {lines[2]}\n"
+        if len(lines) > 3:
+            response += f"Дата: {lines[3]}\n"
+        
+        await message.answer(response, reply_markup=admin_main_menu())
+    else:
+        await message.answer(f"❌ SSH ошибка: {stderr}", reply_markup=admin_main_menu())
 
 @dp.message(F.text == "◀️ Назад к списку")
 async def back_to_server_list(message: Message, state: FSMContext):
@@ -750,7 +1112,7 @@ async def get_vpn_start(message: Message, state: FSMContext):
 @dp.message(F.text == "🎁 3 дня (пробный)")
 async def get_trial_vpn(message: Message):
     user_id = message.from_user.id
-    username = message.from_user.username
+    username = message.from_user.username or f"id_{user_id}"
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -762,28 +1124,48 @@ async def get_trial_vpn(message: Message):
                 await message.answer("❌ Вы уже использовали пробный период!", reply_markup=user_main_menu())
                 return
             
-            # Находим доступный сервер
-            cursor = await db.execute("SELECT id FROM servers WHERE wireguard_configured = TRUE LIMIT 1")
+            # Находим доступный сервер с WireGuard
+            cursor = await db.execute("""
+                SELECT id, name, current_users, max_users 
+                FROM servers 
+                WHERE wireguard_configured = TRUE 
+                AND is_active = TRUE
+                AND current_users < max_users
+                LIMIT 1
+            """)
             server = await cursor.fetchone()
             
             if not server:
                 await message.answer("❌ Нет доступных серверов. Обратитесь в поддержку.", reply_markup=user_main_menu())
                 return
             
-            server_id = server[0]
+            server_id, server_name, current_users, max_users = server
+            
+            # Создаем клиента
+            client_name = f"client_{user_id}_{random.randint(1000, 9999)}"
             subscription_end = (datetime.now() + timedelta(days=3)).isoformat()
             
             await db.execute("""
-                INSERT INTO vpn_users (user_id, username, server_id, subscription_end, trial_used, is_active)
-                VALUES (?, ?, ?, ?, TRUE, TRUE)
-            """, (user_id, username, server_id, subscription_end))
+                INSERT INTO vpn_users (user_id, username, server_id, client_name, subscription_end, trial_used, is_active)
+                VALUES (?, ?, ?, ?, ?, TRUE, TRUE)
+            """, (user_id, username, server_id, client_name, subscription_end))
+            
+            # Обновляем счетчик пользователей
+            await db.execute(
+                "UPDATE servers SET current_users = current_users + 1 WHERE id = ?",
+                (server_id,)
+            )
             
             await db.commit()
         
         await message.answer(
             f"✅ <b>Пробный период активирован!</b>\n\n"
-            f"Доступ активен до: {datetime.fromisoformat(subscription_end).strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"Настройки VPN будут доступны в ближайшее время.",
+            f"👤 Ваш ID: {user_id}\n"
+            f"🖥️ Сервер: {server_name}\n"
+            f"👥 Место: {current_users + 1}/{max_users}\n"
+            f"📅 Действует до: {datetime.fromisoformat(subscription_end).strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"🔑 Имя клиента: {client_name}\n\n"
+            f"Для получения конфигурации обратитесь в поддержку: {SUPPORT_USERNAME}",
             reply_markup=user_main_menu(),
             parse_mode=ParseMode.HTML
         )
@@ -797,7 +1179,7 @@ async def my_services(message: Message):
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""
-                SELECT subscription_end, is_active 
+                SELECT subscription_end, is_active, client_name 
                 FROM vpn_users 
                 WHERE user_id = ? 
                 ORDER BY subscription_end DESC 
@@ -809,7 +1191,7 @@ async def my_services(message: Message):
             await message.answer("📭 У вас нет активных подписок.", reply_markup=user_main_menu())
             return
         
-        sub_end, is_active = user
+        sub_end, is_active, client_name = user
         
         if not is_active:
             await message.answer("❌ Ваша подписка не активна.", reply_markup=user_main_menu())
@@ -825,10 +1207,12 @@ async def my_services(message: Message):
                 days_left = (end_date - now).days
                 status = f"🟢 Активна ({days_left} дней осталось)"
             
-            text = f"📱 <b>Ваша подписка</b>\n\n"
+            text = f"📱 <b>Ваша подписка VPN</b>\n\n"
             text += f"Статус: {status}\n"
-            text += f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-            text += f"Для настройки VPN обратитесь в поддержку: {SUPPORT_USERNAME}"
+            text += f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n"
+            if client_name:
+                text += f"🔑 Имя клиента: {client_name}\n"
+            text += f"\nДля настройки VPN обратитесь в поддержку: {SUPPORT_USERNAME}"
         else:
             text = "📭 Нет информации о подписке"
         
