@@ -1,4 +1,4 @@
-# main.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# main.py - ИСПРАВЛЕННАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ ФАЙЛОВ
 import os
 import asyncio
 import logging
@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ContentType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -319,18 +319,76 @@ async def process_server_name(message: Message, state: FSMContext):
     
     await state.update_data(server_name=message.text)
     await state.set_state(AdminAddServerStates.waiting_for_key)
-    await message.answer("Отправьте приватный SSH ключ (в формате PEM):", reply_markup=back_keyboard())
+    await message.answer(
+        "Отправьте приватный SSH ключ:\n\n"
+        "📎 <b>Пришлите файл с ключом</b> (формат .key, .pem) или\n"
+        "📝 <b>Вставьте текст ключа</b> (начинается с -----BEGIN PRIVATE KEY-----)",
+        reply_markup=back_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
 
+# Обработчик для текстового ключа
 @dp.message(AdminAddServerStates.waiting_for_key)
-async def process_ssh_key(message: Message, state: FSMContext):
+async def process_ssh_key_text(message: Message, state: FSMContext):
     if message.text == "◀️ Назад":
         await state.clear()
         await message.answer("🖥️ <b>Управление серверами</b>", reply_markup=servers_menu(), parse_mode=ParseMode.HTML)
         return
     
-    await state.update_data(ssh_key=message.text)
-    await state.set_state(AdminAddServerStates.waiting_for_connection)
-    await message.answer("Введите строку подключения (user@host:port):", reply_markup=back_keyboard())
+    # Проверяем, похож ли текст на SSH ключ
+    if '-----BEGIN' in message.text and '-----END' in message.text:
+        await state.update_data(ssh_key=message.text)
+        await state.set_state(AdminAddServerStates.waiting_for_connection)
+        await message.answer("✅ Ключ принят!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
+    else:
+        await message.answer("❌ Это не похоже на SSH ключ. Отправьте файл с ключом или текст ключа (начинается с -----BEGIN PRIVATE KEY-----):")
+
+# Обработчик для файлов с ключами
+@dp.message(AdminAddServerStates.waiting_for_key, F.document)
+async def process_ssh_key_file(message: Message, state: FSMContext, bot: Bot):
+    # Проверяем, что это файл с ключом
+    if not message.document:
+        await message.answer("❌ Пожалуйста, отправьте файл с SSH ключом")
+        return
+    
+    # Получаем файл
+    file_id = message.document.file_id
+    try:
+        # Скачиваем файл
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        
+        # Скачиваем содержимое
+        downloaded_file = await bot.download_file(file_path)
+        file_content = downloaded_file.read().decode('utf-8')
+        
+        # Проверяем, что это SSH ключ
+        if '-----BEGIN' not in file_content or '-----END' not in file_content:
+            await message.answer("❌ Файл не содержит SSH ключ. Ключ должен начинаться с -----BEGIN PRIVATE KEY-----")
+            return
+        
+        await state.update_data(ssh_key=file_content)
+        await state.set_state(AdminAddServerStates.waiting_for_connection)
+        await message.answer("✅ Файл с SSH ключом успешно загружен!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
+        
+    except UnicodeDecodeError:
+        # Если не UTF-8, пробуем как бинарный
+        try:
+            downloaded_file = await bot.download_file(file_path)
+            file_content = downloaded_file.read().decode('utf-8', errors='ignore')
+            
+            if '-----BEGIN' not in file_content or '-----END' not in file_content:
+                await message.answer("❌ Не удалось прочитать SSH ключ из файла")
+                return
+            
+            await state.update_data(ssh_key=file_content)
+            await state.set_state(AdminAddServerStates.waiting_for_connection)
+            await message.answer("✅ Файл с SSH ключом загружен!\n\nВведите строку подключения (например: opc@193.122.8.29):", reply_markup=back_keyboard())
+            
+        except Exception as e:
+            await message.answer(f"❌ Ошибка чтения файла: {str(e)}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка загрузки файла: {str(e)}")
 
 @dp.message(AdminAddServerStates.waiting_for_connection)
 async def process_connection_string(message: Message, state: FSMContext):
@@ -341,18 +399,67 @@ async def process_connection_string(message: Message, state: FSMContext):
     
     data = await state.get_data()
     
+    # Проверяем, есть ли ключ
+    if 'ssh_key' not in data or not data['ssh_key']:
+        await message.answer("❌ SSH ключ не найден. Начните заново.", reply_markup=servers_menu())
+        await state.clear()
+        return
+    
     try:
+        # Проверяем формат строки подключения
+        conn_str = message.text.strip()
+        if '@' not in conn_str:
+            await message.answer("❌ Неверный формат. Используйте: user@host или user@host:port")
+            return
+        
+        # Тестируем подключение перед сохранением
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
+            # Сохраняем временно для теста
+            temp_id = await db.execute_insert(
                 "INSERT INTO servers (name, ssh_key, connection_string) VALUES (?, ?, ?)",
-                (data['server_name'], data['ssh_key'], message.text)
+                (data['server_name'], data['ssh_key'], conn_str)
             )
             await db.commit()
-        
-        await state.clear()
-        await message.answer(f"✅ Сервер '{data['server_name']}' добавлен!", reply_markup=admin_main_menu())
+            
+            # Тестируем SSH подключение
+            await message.answer("🔍 Тестирую SSH подключение...")
+            stdout, stderr, success = await execute_ssh_command(temp_id, "echo 'SSH Test OK'", timeout=30)
+            
+            if success:
+                # Обновляем статус
+                await db.execute(
+                    "UPDATE servers SET is_active = TRUE WHERE id = ?",
+                    (temp_id,)
+                )
+                await db.commit()
+                
+                await state.clear()
+                await message.answer(
+                    f"✅ Сервер '{data['server_name']}' успешно добавлен!\n\n"
+                    f"SSH подключение: ✅ Работает\n"
+                    f"Строка подключения: {conn_str}",
+                    reply_markup=admin_main_menu()
+                )
+            else:
+                # Удаляем сервер если не подключились
+                await db.execute("DELETE FROM servers WHERE id = ?", (temp_id,))
+                await db.commit()
+                
+                await message.answer(
+                    f"❌ Не удалось подключиться к серверу:\n\n"
+                    f"Ошибка: {stderr}\n\n"
+                    f"Проверьте:\n"
+                    f"1. Правильность SSH ключа\n"
+                    f"2. Доступность сервера\n"
+                    f"3. Настройки firewall\n"
+                    f"4. Порт SSH (по умолчанию 22)",
+                    reply_markup=servers_menu()
+                )
+                await state.clear()
+                
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=admin_main_menu())
+        await message.answer(f"❌ Ошибка добавления сервера: {str(e)}", reply_markup=admin_main_menu())
+        await state.clear()
 
 @dp.message(F.text == "👤 Пользователи")
 async def admin_users(message: Message, state: FSMContext):
@@ -397,8 +504,31 @@ async def process_gift_period(message: Message, state: FSMContext):
         return
     
     days = period_map[message.text]
-    await state.clear()
-    await message.answer(f"✅ Пользователю @{username} выдано VPN на {days} дней!", reply_markup=admin_main_menu())
+    
+    try:
+        # Находим доступный сервер
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id FROM servers WHERE wireguard_configured = TRUE LIMIT 1")
+            server = await cursor.fetchone()
+            
+            if not server:
+                await message.answer("❌ Нет доступных серверов с настроенным WireGuard")
+                return
+            
+            server_id = server[0]
+            
+            # Сохраняем пользователя
+            await db.execute("""
+                INSERT INTO vpn_users (user_id, username, server_id, subscription_end, trial_used, is_active)
+                VALUES (?, ?, ?, ?, ?, TRUE)
+            """, (0, username, server_id, (datetime.now() + timedelta(days=days)).isoformat(), days == 3))
+            
+            await db.commit()
+        
+        await state.clear()
+        await message.answer(f"✅ Пользователю @{username} выдано VPN на {days} дней!", reply_markup=admin_main_menu())
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=admin_main_menu())
 
 @dp.message(F.text == "📋 Список пользователей")
 async def admin_list_users(message: Message):
