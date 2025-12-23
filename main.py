@@ -1,4 +1,4 @@
-# main.py - ИСПРАВЛЕННЫЙ КОД (ФИНАЛЬНАЯ ВЕРСИЯ)
+# main.py
 import os
 import asyncio
 import logging
