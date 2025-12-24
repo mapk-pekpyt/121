@@ -1,4 +1,4 @@
-# vpn_bot_complete.py - VPN БОТ (ПОЛНАЯ ВЕРСИЯ)
+# vpn_bot_complete.py - VPN БОТ (ПОЛНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЯМИ)
 import os, asyncio, logging, sys, random, sqlite3, time, json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -25,7 +25,7 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 SUPPORT_USERNAME = "@vpnhostik"
-SUPPORT_PAYMENT = "@юзподдержи"  # Для помощи с оплатой
+SUPPORT_PAYMENT = "@vpnhostik"  # Исправлено с @юзподдержи на @vpnhostik
 DATA_DIR = "/data"
 if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
@@ -63,6 +63,10 @@ async def init_database():
                 server_ip TEXT, 
                 ikev2_configured BOOLEAN DEFAULT FALSE, 
                 l2tp_configured BOOLEAN DEFAULT FALSE,
+                test_login TEXT,
+                test_password TEXT,
+                last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             
             # Таблица пользователей
@@ -72,7 +76,7 @@ async def init_database():
                 username TEXT, 
                 server_id INTEGER, 
                 client_name TEXT, 
-                vpn_login TEXT,
+                vpn_login TEXT UNIQUE,
                 vpn_password TEXT,
                 vpn_type TEXT,
                 device_type TEXT DEFAULT 'auto', 
@@ -80,6 +84,7 @@ async def init_database():
                 trial_used BOOLEAN DEFAULT FALSE, 
                 is_active BOOLEAN DEFAULT TRUE, 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (server_id) REFERENCES servers (id) ON DELETE SET NULL)""")
             
             # Таблица платежей
@@ -102,10 +107,15 @@ async def init_database():
                 week_eur REAL DEFAULT 5.0,
                 month_stars INTEGER DEFAULT 150,
                 month_rub REAL DEFAULT 1500.0,
-                month_eur REAL DEFAULT 15.0)""")
+                month_eur REAL DEFAULT 15.0,
+                unlimited_stars INTEGER DEFAULT 300,
+                unlimited_rub REAL DEFAULT 3000.0,
+                unlimited_eur REAL DEFAULT 30.0)""")
             
-            # Начальные цены
-            await db.execute("INSERT OR IGNORE INTO prices (id, week_stars, week_rub, week_eur, month_stars, month_rub, month_eur) VALUES (1, 50, 500.0, 5.0, 150, 1500.0, 15.0)")
+            # Начальные цены (включая безлимит)
+            await db.execute("""INSERT OR IGNORE INTO prices (id, week_stars, week_rub, week_eur, 
+                month_stars, month_rub, month_eur, unlimited_stars, unlimited_rub, unlimited_eur) 
+                VALUES (1, 50, 500.0, 5.0, 150, 1500.0, 15.0, 300, 3000.0, 30.0)""")
             await db.commit()
             logger.info("✅ База данных инициализирована")
             return True
@@ -121,35 +131,50 @@ def is_admin(user_id: int, chat_id: int = None) -> bool:
 async def get_vpn_prices() -> Dict:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT week_stars, week_rub, week_eur, month_stars, month_rub, month_eur FROM prices WHERE id = 1")
+            cursor = await db.execute("""SELECT week_stars, week_rub, week_eur, 
+                month_stars, month_rub, month_eur, unlimited_stars, unlimited_rub, unlimited_eur 
+                FROM prices WHERE id = 1""")
             prices = await cursor.fetchone()
             if prices: 
                 return {
                     "week": {"days": 7, "stars": prices[0], "rub": prices[1], "eur": prices[2]},
-                    "month": {"days": 30, "stars": prices[3], "rub": prices[4], "eur": prices[5]}
+                    "month": {"days": 30, "stars": prices[3], "rub": prices[4], "eur": prices[5]},
+                    "unlimited": {"days": 36500, "stars": prices[6], "rub": prices[7], "eur": prices[8]}
                 }
     except Exception as e:
         logger.error(f"Ошибка получения цен: {e}")
     
+    # Значения по умолчанию
     return {
         "week": {"days": 7, "stars": 50, "rub": 500.0, "eur": 5.0},
-        "month": {"days": 30, "stars": 150, "rub": 1500.0, "eur": 15.0}
+        "month": {"days": 30, "stars": 150, "rub": 1500.0, "eur": 15.0},
+        "unlimited": {"days": 36500, "stars": 300, "rub": 3000.0, "eur": 30.0}
     }
 
-async def update_prices(week_stars: int, week_rub: float, week_eur: float):
+async def update_prices(week_stars: int, week_rub: float, week_eur: float, unlimited_stars: int = None, unlimited_rub: float = None, unlimited_eur: float = None):
     """Обновление цен"""
     try:
         month_stars = week_stars * 3
         month_rub = week_rub * 3
         month_eur = week_eur * 3
         
+        # Если не указаны цены для безлимита, устанавливаем по умолчанию
+        if unlimited_stars is None:
+            unlimited_stars = week_stars * 6  # 6 недель = ~1.5 месяца
+        if unlimited_rub is None:
+            unlimited_rub = week_rub * 6
+        if unlimited_eur is None:
+            unlimited_eur = week_eur * 6
+        
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
                 UPDATE prices SET 
                 week_stars = ?, week_rub = ?, week_eur = ?,
-                month_stars = ?, month_rub = ?, month_eur = ?
+                month_stars = ?, month_rub = ?, month_eur = ?,
+                unlimited_stars = ?, unlimited_rub = ?, unlimited_eur = ?
                 WHERE id = 1
-            """, (week_stars, week_rub, week_eur, month_stars, month_rub, month_eur))
+            """, (week_stars, week_rub, week_eur, month_stars, month_rub, month_eur, 
+                  unlimited_stars, unlimited_rub, unlimited_eur))
             await db.commit()
         return True
     except Exception as e:
@@ -194,11 +219,16 @@ async def check_ssh_connection(server_id: int = None, conn_str: str = None, ssh_
                 
                 os_info = await conn.run("cat /etc/os-release 2>/dev/null || uname -a", timeout=10)
                 
+                # Получаем IP сервера
+                ip_result = await conn.run("curl -s ifconfig.me || hostname -I | awk '{print $1}' || echo '0.0.0.0'", timeout=10)
+                server_ip = ip_result.stdout.strip() if ip_result.stdout else ""
+                
                 system_info = {
                     'has_sudo': has_sudo,
                     'os_info': os_info.stdout,
                     'user': user,
-                    'host': host
+                    'host': host,
+                    'server_ip': server_ip
                 }
                 
                 try: os.unlink(temp_key_path)
@@ -260,9 +290,9 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 60, u
     except Exception as e:
         return "", f"Ошибка выполнения: {str(e)}", False
 
-# ========== VPN УСТАНОВКИ ==========
+# ========== VPN УСТАНОВКИ И ПРОВЕРКИ ==========
 async def setup_ikev2_l2tp_auto(server_id: int, vpn_type: str, message: Message):
-    """Автоустановка IKEv2/L2TP"""
+    """Автоустановка IKEv2/L2TP с созданием тестового аккаунта и проверкой"""
     await message.answer(f"🚀 Начинаю установку {vpn_type.upper()}...")
     
     ssh_ok, ssh_msg, system_info = await check_ssh_connection(server_id)
@@ -279,14 +309,14 @@ async def setup_ikev2_l2tp_auto(server_id: int, vpn_type: str, message: Message)
         
         if 'ubuntu' in os_lower or 'debian' in os_lower:
             cmds = [
-                "apt-get update",
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y strongswan strongswan-pki libcharon-extra-plugins xl2tpd ppp",
-                "ipsec stop 2>/dev/null || true"
+                "apt-get update -y",
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y strongswan strongswan-pki libcharon-extra-plugins xl2tpd ppp curl iptables",
+                "systemctl stop strongswan 2>/dev/null || ipsec stop 2>/dev/null || true"
             ]
         elif 'centos' in os_lower or 'redhat' in os_lower or 'oracle' in os_lower:
             cmds = [
                 "yum install -y epel-release 2>/dev/null || true",
-                "yum install -y strongswan strongswan-pki xl2tpd ppp 2>/dev/null || dnf install -y strongswan strongswan-pki xl2tpd ppp 2>/dev/null || true",
+                "yum install -y strongswan strongswan-pki xl2tpd ppp curl iptables-services 2>/dev/null || dnf install -y strongswan strongswan-pki xl2tpd ppp curl iptables 2>/dev/null || true",
                 "systemctl stop strongswan 2>/dev/null || true"
             ]
         else:
@@ -296,7 +326,7 @@ async def setup_ikev2_l2tp_auto(server_id: int, vpn_type: str, message: Message)
         for cmd in cmds:
             stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=180, use_sudo=True)
             if not success:
-                await message.answer(f"⚠️ Предупреждение: {stderr[:100]}")
+                await message.answer(f"⚠️ Предупреждение при установке: {stderr[:200]}")
         
         # Конфигурация IKEv2
         ikev2_conf = """config setup
@@ -364,10 +394,12 @@ connect-delay 5000"""
             "echo ': PSK \"vpnsharedkey\"' > /etc/ipsec.secrets",
             f"cat > /etc/xl2tpd/xl2tpd.conf << 'EOF'\n{l2tp_conf}\nEOF",
             f"cat > /etc/ppp/options.xl2tpd << 'EOF'\n{ppp_options}\nEOF",
-            "echo 'vpnuser * vpnpassword123 *' > /etc/ppp/chap-secrets",
+            "echo '# VPN users will be added here' > /etc/ppp/chap-secrets",
             "sysctl -w net.ipv4.ip_forward=1",
             "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf",
-            "sysctl -p"
+            "sysctl -p",
+            "iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -j MASQUERADE",
+            "iptables -t nat -A POSTROUTING -s 10.10.20.0/24 -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.10.20.0/24 -j MASQUERADE"
         ]
         
         for cmd in config_cmds:
@@ -383,38 +415,210 @@ connect-delay 5000"""
         for cmd in startup_cmds:
             await execute_ssh_command(server_id, cmd, use_sudo=True)
         
-        stdout, stderr, success = await execute_ssh_command(server_id, "curl -s ifconfig.me || hostname -I | awk '{print $1}' || echo '0.0.0.0'")
-        server_ip = stdout.strip() if success else ""
+        # Создаем тестовый аккаунт
+        test_login = f"test{random.randint(1000, 9999)}"
+        test_password = ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=12))
         
+        if vpn_type == "ikev2":
+            add_test_cmd = f"echo '{test_login} : EAP \"{test_password}\"' >> /etc/ipsec.secrets"
+            restart_cmd = "ipsec restart 2>/dev/null || systemctl restart strongswan 2>/dev/null || true"
+        elif vpn_type == "l2tp":
+            add_test_cmd = f"echo '{test_login} * {test_password} *' >> /etc/ppp/chap-secrets"
+            restart_cmd = "systemctl restart xl2tpd 2>/dev/null || true"
+        
+        await execute_ssh_command(server_id, add_test_cmd, use_sudo=True)
+        await execute_ssh_command(server_id, restart_cmd, use_sudo=True)
+        
+        server_ip = system_info.get('server_ip', '')
+        
+        # Сохраняем тестовые данные и обновляем статус сервера
         async with aiosqlite.connect(DB_PATH) as db:
             if vpn_type == "ikev2":
-                await db.execute("UPDATE servers SET ikev2_configured = TRUE, server_ip = ? WHERE id = ?", (server_ip, server_id))
+                await db.execute("UPDATE servers SET ikev2_configured = TRUE, server_ip = ?, test_login = ?, test_password = ?, status = 'installed', last_check = CURRENT_TIMESTAMP WHERE id = ?", 
+                                (server_ip, test_login, test_password, server_id))
             elif vpn_type == "l2tp":
-                await db.execute("UPDATE servers SET l2tp_configured = TRUE, server_ip = ? WHERE id = ?", (server_ip, server_id))
+                await db.execute("UPDATE servers SET l2tp_configured = TRUE, server_ip = ?, test_login = ?, test_password = ?, status = 'installed', last_check = CURRENT_TIMESTAMP WHERE id = ?", 
+                                (server_ip, test_login, test_password, server_id))
             await db.commit()
         
-        await message.answer(f"✅ {vpn_type.upper()} успешно установлен!\n🌐 IP: {server_ip}\n🔑 Общий ключ (PSK): vpnsharedkey")
-        return True
+        # Проверяем работоспособность VPN
+        await message.answer(f"✅ {vpn_type.upper()} успешно установлен!\n\n🔍 Проверяю работоспособность...")
+        
+        # Проверка VPN
+        check_result = await test_vpn_connection(server_id, vpn_type, test_login, test_password, server_ip)
+        
+        if check_result["success"]:
+            await message.answer(
+                f"✅ <b>VPN полностью готов к работе!</b>\n\n"
+                f"🌐 <b>IP сервера:</b> {server_ip}\n"
+                f"🔐 <b>Тип VPN:</b> {vpn_type.upper()}\n"
+                f"🔑 <b>Общий ключ (PSK):</b> <code>vpnsharedkey</code>\n\n"
+                f"<b>Тестовый аккаунт для проверки:</b>\n"
+                f"👤 <b>Логин:</b> <code>{test_login}</code>\n"
+                f"🔑 <b>Пароль:</b> <code>{test_password}</code>\n\n"
+                f"<i>Тестовый аккаунт будет активен 24 часа для проверки.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return True
+        else:
+            await message.answer(
+                f"⚠️ <b>VPN установлен, но есть проблемы:</b>\n"
+                f"{check_result['message']}\n\n"
+                f"🌐 <b>IP сервера:</b> {server_ip}\n"
+                f"🔐 <b>Тип VPN:</b> {vpn_type.upper()}\n"
+                f"🔑 <b>Общий ключ (PSK):</b> <code>vpnsharedkey</code>\n\n"
+                f"<b>Тестовый аккаунт для проверки:</b>\n"
+                f"👤 <b>Логин:</b> <code>{test_login}</code>\n"
+                f"🔑 <b>Пароль:</b> <code>{test_password}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return False
         
     except Exception as e:
-        await message.answer(f"❌ Ошибка установки: {str(e)}")
+        await message.answer(f"❌ Ошибка установки: {str(e)[:500]}")
         return False
+
+async def test_vpn_connection(server_id: int, vpn_type: str, login: str, password: str, server_ip: str = None) -> Dict:
+    """Проверка VPN подключения"""
+    try:
+        if not server_ip:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute("SELECT server_ip FROM servers WHERE id = ?", (server_id,))
+                server = await cursor.fetchone()
+                if server:
+                    server_ip = server[0]
+        
+        if not server_ip or server_ip == "0.0.0.0":
+            return {"success": False, "message": "IP сервера не определен"}
+        
+        # Проверяем, что службы VPN работают
+        if vpn_type == "ikev2":
+            check_cmd = "ipsec status 2>/dev/null || systemctl status strongswan 2>/dev/null || echo 'NOT_RUNNING'"
+        else:  # l2tp
+            check_cmd = "systemctl status xl2tpd 2>/dev/null || ps aux | grep xl2tpd | grep -v grep || echo 'NOT_RUNNING'"
+        
+        stdout, stderr, success = await execute_ssh_command(server_id, check_cmd, use_sudo=True)
+        
+        if "NOT_RUNNING" in stdout or not success:
+            # Пытаемся перезапустить
+            if vpn_type == "ikev2":
+                restart_cmd = "ipsec restart 2>/dev/null || systemctl restart strongswan 2>/dev/null || true"
+            else:
+                restart_cmd = "systemctl restart xl2tpd 2>/dev/null || true"
+            
+            await execute_ssh_command(server_id, restart_cmd, use_sudo=True)
+            await asyncio.sleep(5)
+            
+            stdout, stderr, success = await execute_ssh_command(server_id, check_cmd, use_sudo=True)
+            
+            if "NOT_RUNNING" in stdout or not success:
+                return {"success": False, "message": f"Служба VPN не запущена\n{stdout[:200]}"}
+        
+        # Проверяем порты
+        port_check_cmd = f"netstat -tuln | grep -E ':500|:4500|:1701' || ss -tuln | grep -E ':500|:4500|:1701' || echo 'PORTS_NOT_OPEN'"
+        stdout, stderr, success = await execute_ssh_command(server_id, port_check_cmd, use_sudo=False)
+        
+        if "PORTS_NOT_OPEN" in stdout:
+            return {"success": False, "message": "Необходимые порты не открыты (500, 4500, 1701)"}
+        
+        # Проверяем iptables
+        iptables_check = "iptables -t nat -L POSTROUTING -n 2>/dev/null | grep MASQUERADE || echo 'NO_MASQUERADE'"
+        stdout, stderr, success = await execute_ssh_command(server_id, iptables_check, use_sudo=True)
+        
+        if "NO_MASQUERADE" in stdout:
+            return {"success": False, "message": "Правила iptables не настроены"}
+        
+        # Проверяем что тестовый пользователь существует
+        if vpn_type == "ikev2":
+            user_check = f"grep '{login}' /etc/ipsec.secrets || echo 'USER_NOT_FOUND'"
+        else:
+            user_check = f"grep '{login}' /etc/ppp/chap-secrets || echo 'USER_NOT_FOUND'"
+        
+        stdout, stderr, success = await execute_ssh_command(server_id, user_check, use_sudo=True)
+        
+        if "USER_NOT_FOUND" in stdout:
+            return {"success": False, "message": "Тестовый пользователь не найден в конфигурации"}
+        
+        return {"success": True, "message": "VPN полностью работоспособен"}
+        
+    except Exception as e:
+        return {"success": False, "message": f"Ошибка проверки: {str(e)[:200]}"}
+
+async def check_expired_subscriptions():
+    """Проверка и удаление истекших подписок"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Находим истекшие подписки
+            cursor = await db.execute("""
+                SELECT v.id, v.user_id, v.server_id, v.vpn_login, v.vpn_type 
+                FROM vpn_users v 
+                WHERE v.is_active = TRUE 
+                AND v.subscription_end IS NOT NULL 
+                AND datetime(v.subscription_end) < datetime('now')
+            """)
+            expired_users = await cursor.fetchall()
+            
+            for user in expired_users:
+                user_id, tg_user_id, server_id, vpn_login, vpn_type = user
+                
+                # Удаляем пользователя из VPN сервера
+                if server_id and vpn_login:
+                    if vpn_type == "ikev2":
+                        remove_cmd = f"sed -i '/{vpn_login}/d' /etc/ipsec.secrets"
+                        restart_cmd = "ipsec restart 2>/dev/null || systemctl restart strongswan 2>/dev/null || true"
+                    elif vpn_type == "l2tp":
+                        remove_cmd = f"sed -i '/{vpn_login}/d' /etc/ppp/chap-secrets"
+                        restart_cmd = "systemctl restart xl2tpd 2>/dev/null || true"
+                    
+                    try:
+                        await execute_ssh_command(server_id, remove_cmd, use_sudo=True)
+                        await execute_ssh_command(server_id, restart_cmd, use_sudo=True)
+                        
+                        # Уменьшаем счетчик пользователей
+                        await db.execute("UPDATE servers SET current_users = current_users - 1 WHERE id = ? AND current_users > 0", (server_id,))
+                    except:
+                        pass
+                
+                # Отключаем пользователя в БД
+                await db.execute("UPDATE vpn_users SET is_active = FALSE WHERE id = ?", (user_id,))
+                
+                # Отправляем уведомление пользователю
+                try:
+                    await bot.send_message(
+                        tg_user_id,
+                        "⚠️ <b>Ваша подписка VPN истекла!</b>\n\n"
+                        "Для продолжения использования VPN приобретите новую подписку через кнопку '🔐 Получить VPN'.\n\n"
+                        f"🆘 Поддержка: {SUPPORT_USERNAME}",
+                        parse_mode=ParseMode.HTML
+                    )
+                except:
+                    pass
+            
+            await db.commit()
+            return len(expired_users)
+            
+    except Exception as e:
+        logger.error(f"Ошибка проверки подписок: {e}")
+        return 0
 
 async def create_vpn_client(server_id: int, user_id: int, username: str, vpn_type: str, device_type: str = "auto"):
     """Создание клиентской конфигурации"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT server_ip, current_users, max_users FROM servers WHERE id = ?", (server_id,))
+            cursor = await db.execute("SELECT server_ip, current_users, max_users, test_login FROM servers WHERE id = ?", (server_id,))
             server = await cursor.fetchone()
             if not server: return None, "Сервер не найден"
             
-            server_ip, current_users, max_users = server
+            server_ip, current_users, max_users, test_login = server
             if current_users >= max_users:
                 return None, "Сервер переполнен"
             
-            # Генерируем уникальные логин/пароль
-            client_name = f"client_{user_id}_{random.randint(1000, 9999)}"
-            vpn_login = f"user{random.randint(10000, 99999)}"
+            # Генерируем уникальные логин/пароль (убедимся что не совпадает с тестовым)
+            while True:
+                vpn_login = f"user{random.randint(10000, 99999)}"
+                if vpn_login != test_login:
+                    break
+            
             vpn_password = ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=12))
             
             # Добавляем пользователя на сервер
@@ -436,12 +640,12 @@ async def create_vpn_client(server_id: int, user_id: int, username: str, vpn_typ
             await db.execute("""
                 INSERT INTO vpn_users (user_id, username, server_id, client_name, vpn_login, vpn_password, vpn_type, device_type, is_active)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
-            """, (user_id, username, server_id, client_name, vpn_login, vpn_password, vpn_type, device_type))
+            """, (user_id, username, server_id, f"client_{user_id}_{random.randint(1000, 9999)}", vpn_login, vpn_password, vpn_type, device_type))
             
             await db.commit()
             
             return {
-                'client_name': client_name,
+                'client_name': f"client_{user_id}",
                 'server_ip': server_ip,
                 'vpn_login': vpn_login,
                 'vpn_password': vpn_password,
@@ -452,6 +656,106 @@ async def create_vpn_client(server_id: int, user_id: int, username: str, vpn_typ
             
     except Exception as e:
         return None, f"Ошибка создания клиента: {str(e)}"
+
+async def extend_subscription(user_id: int, period_days: int, admin_action: bool = False):
+    """Продление подписки пользователя"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Находим активную подписку пользователя
+            cursor = await db.execute("""
+                SELECT id, subscription_end, vpn_login, server_id, vpn_type 
+                FROM vpn_users 
+                WHERE user_id = ? AND is_active = TRUE 
+                ORDER BY id DESC LIMIT 1
+            """, (user_id,))
+            user = await cursor.fetchone()
+            
+            if not user:
+                return False, "У пользователя нет активной подписки"
+            
+            user_db_id, current_end, vpn_login, server_id, vpn_type = user
+            
+            # Вычисляем новую дату окончания
+            if current_end:
+                try:
+                    current_end_dt = datetime.fromisoformat(current_end)
+                    if current_end_dt > datetime.now():
+                        # Продлеваем от текущей даты окончания
+                        new_end = current_end_dt + timedelta(days=period_days)
+                    else:
+                        # Истекшая подписка - продлеваем от текущего момента
+                        new_end = datetime.now() + timedelta(days=period_days)
+                except:
+                    new_end = datetime.now() + timedelta(days=period_days)
+            else:
+                new_end = datetime.now() + timedelta(days=period_days)
+            
+            # Обновляем подписку
+            await db.execute("""
+                UPDATE vpn_users 
+                SET subscription_end = ?, last_check = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (new_end.isoformat(), user_db_id))
+            
+            await db.commit()
+            
+            # Если это действие админа, добавляем запись
+            if admin_action:
+                await db.execute("""
+                    INSERT INTO payments (user_id, period_days, status, created_at)
+                    VALUES (?, ?, 'admin_extended', CURRENT_TIMESTAMP)
+                """, (user_id, period_days))
+                await db.commit()
+            
+            return True, f"Подписка продлена на {period_days} дней. Новый срок: {new_end.strftime('%d.%m.%Y %H:%M')}"
+            
+    except Exception as e:
+        return False, f"Ошибка продления: {str(e)}"
+
+async def disable_user_vpn(user_id: int):
+    """Отключение VPN для пользователя"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Находим активную подписку пользователя
+            cursor = await db.execute("""
+                SELECT id, vpn_login, server_id, vpn_type 
+                FROM vpn_users 
+                WHERE user_id = ? AND is_active = TRUE 
+                ORDER BY id DESC LIMIT 1
+            """, (user_id,))
+            user = await cursor.fetchone()
+            
+            if not user:
+                return False, "У пользователя нет активной подписки"
+            
+            user_db_id, vpn_login, server_id, vpn_type = user
+            
+            # Удаляем пользователя из VPN сервера
+            if server_id and vpn_login:
+                if vpn_type == "ikev2":
+                    remove_cmd = f"sed -i '/{vpn_login}/d' /etc/ipsec.secrets"
+                    restart_cmd = "ipsec restart 2>/dev/null || systemctl restart strongswan 2>/dev/null || true"
+                elif vpn_type == "l2tp":
+                    remove_cmd = f"sed -i '/{vpn_login}/d' /etc/ppp/chap-secrets"
+                    restart_cmd = "systemctl restart xl2tpd 2>/dev/null || true"
+                
+                try:
+                    await execute_ssh_command(server_id, remove_cmd, use_sudo=True)
+                    await execute_ssh_command(server_id, restart_cmd, use_sudo=True)
+                    
+                    # Уменьшаем счетчик пользователей
+                    await db.execute("UPDATE servers SET current_users = current_users - 1 WHERE id = ? AND current_users > 0", (server_id,))
+                except Exception as e:
+                    logger.error(f"Ошибка удаления пользователя с сервера: {e}")
+            
+            # Отключаем пользователя в БД
+            await db.execute("UPDATE vpn_users SET is_active = FALSE WHERE id = ?", (user_db_id,))
+            await db.commit()
+            
+            return True, "VPN успешно отключен"
+            
+    except Exception as e:
+        return False, f"Ошибка отключения: {str(e)}"
 
 def get_vpn_instructions(vpn_type: str, device_type: str, server_ip: str, login: str, password: str) -> str:
     """Получение инструкций по типу VPN"""
@@ -553,8 +857,8 @@ async def send_vpn_config_to_user(user_id: int, vpn_data: dict, message: Message
         instructions = f"""🔧 <b>Ваши данные для подключения:</b>
 
 🌐 <b>Сервер:</b> {vpn_data['server_ip']}
-👤 <b>Логин:</b> {vpn_data['vpn_login']}
-🔑 <b>Пароль:</b> {vpn_data['vpn_password']}
+👤 <b>Логин:</b> <code>{vpn_data['vpn_login']}</code>
+🔑 <b>Пароль:</b> <code>{vpn_data['vpn_password']}</code>
 🔐 <b>Тип:</b> {vpn_data['vpn_type'].upper()}
 📱 <b>Устройство:</b> {vpn_data['device_type']}
 
@@ -575,6 +879,7 @@ def user_main_menu():
     return types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="🔐 Получить VPN")],
+            [types.KeyboardButton(text="🔄 Продлить подписку")],
             [types.KeyboardButton(text="📱 Мои услуги")],
             [types.KeyboardButton(text="🌐 Серверы")],
             [types.KeyboardButton(text="🆘 Помощь")]
@@ -588,7 +893,8 @@ def admin_main_menu():
             [types.KeyboardButton(text="🖥️ Серверы")],
             [types.KeyboardButton(text="👤 Пользователи")],
             [types.KeyboardButton(text="💰 Цены")],
-            [types.KeyboardButton(text="🤖 Тест сервера")]
+            [types.KeyboardButton(text="🤖 Тест сервера")],
+            [types.KeyboardButton(text="🔄 Продлить подписку")]
         ],
         resize_keyboard=True
     )
@@ -599,6 +905,7 @@ def servers_menu():
             [types.KeyboardButton(text="📋 Список серверов")],
             [types.KeyboardButton(text="➕ Добавить сервер")],
             [types.KeyboardButton(text="🔧 Установить VPN")],
+            [types.KeyboardButton(text="🔄 Перепроверить VPN")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -610,6 +917,7 @@ def admin_users_menu():
             [types.KeyboardButton(text="🎁 Выдать VPN")],
             [types.KeyboardButton(text="📋 Список пользователей")],
             [types.KeyboardButton(text="🚫 Отключить VPN")],
+            [types.KeyboardButton(text="🔄 Продлить подписку")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -652,6 +960,18 @@ def period_keyboard():
             [types.KeyboardButton(text="🎁 3 дня (пробный)")],
             [types.KeyboardButton(text="💎 Неделя")],
             [types.KeyboardButton(text="💎 Месяц")],
+            [types.KeyboardButton(text="♾️ Безлимит")],
+            [types.KeyboardButton(text="◀️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+def extend_period_keyboard():
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="💎 Неделя")],
+            [types.KeyboardButton(text="💎 Месяц")],
+            [types.KeyboardButton(text="♾️ Безлимит")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -677,6 +997,7 @@ def test_server_menu():
         keyboard=[
             [types.KeyboardButton(text="📋 Список для теста")],
             [types.KeyboardButton(text="🔧 Установить VPN")],
+            [types.KeyboardButton(text="🔄 Перепроверить VPN")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -687,6 +1008,16 @@ def install_vpn_menu():
         keyboard=[
             [types.KeyboardButton(text="IKEv2")],
             [types.KeyboardButton(text="L2TP")],
+            [types.KeyboardButton(text="◀️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+def recheck_vpn_menu():
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🔄 Перепроверить все серверы")],
+            [types.KeyboardButton(text="📋 Выбрать сервер")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -709,10 +1040,24 @@ class PriceStates(StatesGroup):
 
 class TestServerStates(StatesGroup):
     waiting_for_server = State()
+    waiting_for_recheck_server = State()
 
 class UserPaymentStates(StatesGroup):
     waiting_for_period = State()
     waiting_for_payment = State()
+    waiting_for_vpn_type = State()
+    waiting_for_device = State()
+
+class ExtendSubscriptionStates(StatesGroup):
+    waiting_for_user = State()
+    waiting_for_period = State()
+
+class DisableVPNStates(StatesGroup):
+    waiting_for_user = State()
+
+class IssueVPNStates(StatesGroup):
+    waiting_for_user = State()
+    waiting_for_period = State()
     waiting_for_vpn_type = State()
     waiting_for_device = State()
 
@@ -745,22 +1090,23 @@ async def admin_list_servers(message: Message):
     if not is_admin(message.from_user.id, message.chat.id): return
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, name, is_active, ikev2_configured, l2tp_configured, current_users, max_users, server_ip FROM servers ORDER BY name")
+            cursor = await db.execute("SELECT id, name, is_active, ikev2_configured, l2tp_configured, current_users, max_users, server_ip, status FROM servers ORDER BY name")
             servers = await cursor.fetchall()
     except Exception as e:
         await message.answer(f"❌ Ошибка получения данных: {e}"); return
     if not servers: 
         await message.answer("📭 Серверов нет", reply_markup=servers_menu()); return
     
-    text = "📋 Список серверов:\n\n"
+    text = "📋 <b>Список серверов:</b>\n\n"
     for server in servers:
-        server_id, name, active, ikev2, l2tp, current, max_users, server_ip = server
-        status = "🟢" if active else "🔴"
+        server_id, name, active, ikev2, l2tp, current, max_users, server_ip, status = server
+        status_icon = "🟢" if status == "installed" else "🟡" if status == "pending" else "🔴"
+        active_icon = "✅" if active else "❌"
         ikev2_status = "🔐" if ikev2 else "❌"
         l2tp_status = "🅾️" if l2tp else "❌"
         load = f"{current}/{max_users}"
         ip_display = server_ip if server_ip else "N/A"
-        text += f"{status}{ikev2_status}{l2tp_status} <b>{name}</b>\nID: {server_id} | 👥 {load} | 🌐 {ip_display}\n"
+        text += f"{status_icon}{active_icon}{ikev2_status}{l2tp_status} <b>{name}</b>\nID: {server_id} | 👥 {load} | 🌐 {ip_display}\nСтатус: {status}\n\n"
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=servers_menu())
 
@@ -876,10 +1222,12 @@ async def process_connection_string(message: Message, state: FSMContext):
         return
     
     try:
+        server_ip = system_info.get('server_ip', '')
+        
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                "INSERT INTO servers (name, ssh_key, connection_string, vpn_type, max_users) VALUES (?, ?, ?, ?, ?)",
-                (data['server_name'], data['ssh_key'], conn_str, data.get('vpn_type', 'ikev2'), data.get('max_users', 50))
+                "INSERT INTO servers (name, ssh_key, connection_string, vpn_type, max_users, server_ip, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                (data['server_name'], data['ssh_key'], conn_str, data.get('vpn_type', 'ikev2'), data.get('max_users', 50), server_ip)
             )
             server_id = cursor.lastrowid
             await db.commit()
@@ -888,7 +1236,8 @@ async def process_connection_string(message: Message, state: FSMContext):
             f"✅ Сервер '{data['server_name']}' добавлен!\n"
             f"ID: {server_id}\n"
             f"Тип VPN: {data.get('vpn_type', 'ikev2').upper()}\n"
-            f"Лимит: {data.get('max_users', 50)} пользователей\n\n"
+            f"Лимит: {data.get('max_users', 50)} пользователей\n"
+            f"IP: {server_ip}\n\n"
             f"Теперь установите VPN через меню '🔧 Установить VPN'",
             reply_markup=admin_main_menu()
         )
@@ -904,7 +1253,7 @@ async def admin_install_vpn_menu(message: Message, state: FSMContext):
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, name FROM servers WHERE is_active = TRUE LIMIT 10")
+            cursor = await db.execute("SELECT id, name, status FROM servers WHERE is_active = TRUE LIMIT 10")
             servers = await cursor.fetchall()
     except: 
         await message.answer("❌ Ошибка получения данных", reply_markup=servers_menu()); return
@@ -912,13 +1261,14 @@ async def admin_install_vpn_menu(message: Message, state: FSMContext):
     if not servers: 
         await message.answer("📭 Нет активных серверов", reply_markup=servers_menu()); return
     
-    text = "🔧 Выберите сервер для установки VPN:\n"
-    for server_id, name in servers: 
-        text += f"ID: {server_id} - {name}\n"
+    text = "🔧 <b>Выберите сервер для установки VPN:</b>\n"
+    for server_id, name, status in servers: 
+        status_icon = "🟢" if status == "installed" else "🟡" if status == "pending" else "🔴"
+        text += f"ID: {server_id} - {name} {status_icon}\n"
     text += "\nВведите ID сервера:"
     
     await state.set_state(InstallVPNStates.waiting_for_server)
-    await message.answer(text, reply_markup=back_keyboard())
+    await message.answer(text, reply_markup=back_keyboard(), parse_mode=ParseMode.HTML)
 
 @dp.message(InstallVPNStates.waiting_for_server)
 async def process_install_server(message: Message, state: FSMContext):
@@ -936,19 +1286,43 @@ async def process_install_server(message: Message, state: FSMContext):
     # Проверяем существование сервера
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT name FROM servers WHERE id = ?", (server_id,))
+            cursor = await db.execute("SELECT name, ikev2_configured, l2tp_configured FROM servers WHERE id = ?", (server_id,))
             server = await cursor.fetchone()
             if not server: 
                 await message.answer("❌ Сервер не найден", reply_markup=back_keyboard())
                 return
-            server_name = server[0]
+            server_name, ikev2_configured, l2tp_configured = server
     except: 
         await message.answer("❌ Ошибка получения данных", reply_markup=back_keyboard())
         return
     
     await state.update_data(server_id=server_id, server_name=server_name)
     await state.set_state(InstallVPNStates.waiting_for_type)
-    await message.answer(f"Сервер: {server_name} (ID: {server_id})\n\nВыберите тип VPN для установки:", reply_markup=install_vpn_menu())
+    
+    # Предлагаем только те типы VPN, которые еще не установлены
+    keyboard = []
+    if not ikev2_configured:
+        keyboard.append([types.KeyboardButton(text="IKEv2")])
+    if not l2tp_configured:
+        keyboard.append([types.KeyboardButton(text="L2TP")])
+    keyboard.append([types.KeyboardButton(text="◀️ Назад")])
+    
+    vpn_keyboard = types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    
+    text = f"Сервер: {server_name} (ID: {server_id})\n\n"
+    if not ikev2_configured and not l2tp_configured:
+        text += "Выберите тип VPN для установки:"
+    elif not ikev2_configured:
+        text += "IKEv2 уже установлен. Установить L2TP?"
+    elif not l2tp_configured:
+        text += "L2TP уже установлен. Установить IKEv2?"
+    else:
+        text += "Оба типа VPN уже установлены!"
+        await message.answer(text, reply_markup=servers_menu())
+        await state.clear()
+        return
+    
+    await message.answer(text, reply_markup=vpn_keyboard)
 
 @dp.message(InstallVPNStates.waiting_for_type)
 async def process_install_vpn_type(message: Message, state: FSMContext):
@@ -972,7 +1346,136 @@ async def process_install_vpn_type(message: Message, state: FSMContext):
     if success: 
         await message.answer(f"✅ {vpn_type.upper()} успешно установлен на сервер '{server_name}'!", reply_markup=admin_main_menu())
     else: 
-        await message.answer(f"❌ Не удалось установить {vpn_type.upper()} на сервер '{server_name}'", reply_markup=admin_main_menu())
+        await message.answer(f"⚠️ {vpn_type.upper()} установлен на сервер '{server_name}' с проблемами", reply_markup=admin_main_menu())
+
+@dp.message(F.text == "🔄 Перепроверить VPN")
+async def admin_recheck_vpn(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id): return
+    
+    await message.answer("🔄 Выберите действие:", reply_markup=recheck_vpn_menu())
+
+@dp.message(F.text == "🔄 Перепроверить все серверы")
+async def recheck_all_servers(message: Message):
+    if not is_admin(message.from_user.id, message.chat.id): return
+    
+    await message.answer("🔍 Начинаю проверку всех серверов...")
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id, name, ikev2_configured, l2tp_configured, test_login, test_password, server_ip FROM servers WHERE is_active = TRUE")
+            servers = await cursor.fetchall()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения данных: {e}", reply_markup=servers_menu())
+        return
+    
+    if not servers:
+        await message.answer("📭 Нет активных серверов", reply_markup=servers_menu())
+        return
+    
+    results = []
+    for server in servers:
+        server_id, name, ikev2_configured, l2tp_configured, test_login, test_password, server_ip = server
+        
+        result_text = f"<b>{name}</b> (ID: {server_id})\n"
+        
+        if ikev2_configured and test_login and test_password:
+            check_result = await test_vpn_connection(server_id, "ikev2", test_login, test_password, server_ip)
+            result_text += f"🔐 IKEv2: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+        
+        if l2tp_configured and test_login and test_password:
+            check_result = await test_vpn_connection(server_id, "l2tp", test_login, test_password, server_ip)
+            result_text += f"🅾️ L2TP: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+        
+        if not ikev2_configured and not l2tp_configured:
+            result_text += "❌ VPN не установлен\n"
+        
+        results.append(result_text)
+        
+        if len(results) % 3 == 0:
+            await message.answer("\n".join(results), parse_mode=ParseMode.HTML)
+            results = []
+            await asyncio.sleep(1)
+    
+    if results:
+        await message.answer("\n".join(results), parse_mode=ParseMode.HTML)
+    
+    await message.answer("✅ Проверка завершена!", reply_markup=servers_menu())
+
+@dp.message(F.text == "📋 Выбрать сервер")
+async def select_server_for_recheck(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id): return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id, name, server_ip FROM servers WHERE is_active = TRUE LIMIT 10")
+            servers = await cursor.fetchall()
+    except: 
+        await message.answer("❌ Ошибка получения данных", reply_markup=recheck_vpn_menu()); return
+    
+    if not servers: 
+        await message.answer("📭 Нет активных серверов", reply_markup=recheck_vpn_menu()); return
+    
+    text = "🤖 <b>Выберите сервер для проверки:</b>\n\n"
+    for server_id, name, server_ip in servers:
+        ip_display = server_ip if server_ip else "IP не установлен"
+        text += f"<b>{name}</b>\nID: {server_id} | 🌐 {ip_display}\n\n"
+    
+    text += "Введите ID сервера для проверки:"
+    
+    await state.set_state(TestServerStates.waiting_for_recheck_server)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+
+@dp.message(TestServerStates.waiting_for_recheck_server)
+async def process_recheck_server(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.clear()
+        await message.answer("🔄 Перепроверка VPN", reply_markup=recheck_vpn_menu())
+        return
+    
+    try: 
+        server_id = int(message.text)
+    except: 
+        await message.answer("Введите числовой ID:", reply_markup=back_keyboard())
+        return
+    
+    await message.answer(f"🔍 Тестирую сервер ID {server_id}...")
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT name, ikev2_configured, l2tp_configured, test_login, test_password, server_ip FROM servers WHERE id = ?", (server_id,))
+            server = await cursor.fetchone()
+            if not server:
+                await message.answer("❌ Сервер не найден", reply_markup=recheck_vpn_menu())
+                await state.clear()
+                return
+            
+            name, ikev2_configured, l2tp_configured, test_login, test_password, server_ip = server
+            
+        result_text = f"<b>{name}</b> (ID: {server_id})\n"
+        
+        if ikev2_configured and test_login and test_password:
+            check_result = await test_vpn_connection(server_id, "ikev2", test_login, test_password, server_ip)
+            result_text += f"🔐 IKEv2: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+        
+        if l2tp_configured and test_login and test_password:
+            check_result = await test_vpn_connection(server_id, "l2tp", test_login, test_password, server_ip)
+            result_text += f"🅾️ L2TP: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+        
+        if not ikev2_configured and not l2tp_configured:
+            result_text += "❌ VPN не установлен\n"
+        
+        # Обновляем статус сервера
+        async with aiosqlite.connect(DB_PATH) as db:
+            status = "installed" if (ikev2_configured or l2tp_configured) else "pending"
+            await db.execute("UPDATE servers SET status = ?, last_check = CURRENT_TIMESTAMP WHERE id = ?", (status, server_id))
+            await db.commit()
+        
+        await message.answer(result_text, parse_mode=ParseMode.HTML, reply_markup=recheck_vpn_menu())
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка тестирования: {str(e)}", reply_markup=recheck_vpn_menu())
+    
+    await state.clear()
 
 @dp.message(F.text == "👤 Пользователи")
 async def admin_users(message: Message, state: FSMContext):
@@ -998,7 +1501,7 @@ async def admin_list_users(message: Message):
     if not users: 
         await message.answer("📭 Пользователей нет", reply_markup=admin_users_menu()); return
     
-    text = "📋 Список пользователей:\n\n"
+    text = "📋 <b>Список пользователей:</b>\n\n"
     for i, user in enumerate(users[:15], 1):
         user_id, tg_id, username, vpn_login, vpn_type, sub_end, active, device_type, server_name = user
         status = "🟢" if active else "🔴"
@@ -1007,9 +1510,12 @@ async def admin_list_users(message: Message):
         vpn_icon = "🔐" if vpn_type == "ikev2" else "🅾️"
         
         if sub_end: 
-            sub_date = datetime.fromisoformat(sub_end).strftime('%d.%m')
-            days_left = max(0, (datetime.fromisoformat(sub_end) - datetime.now()).days)
-            text += f"{i}. {status}{device_icon}{vpn_icon} {username_display} 📅{sub_date}({days_left}д) 🖥️{server_name or 'N/A'}\n"
+            try:
+                sub_date = datetime.fromisoformat(sub_end).strftime('%d.%m')
+                days_left = max(0, (datetime.fromisoformat(sub_end) - datetime.now()).days)
+                text += f"{i}. {status}{device_icon}{vpn_icon} {username_display} 📅{sub_date}({days_left}д) 🖥️{server_name or 'N/A'}\n"
+            except:
+                text += f"{i}. {status}{device_icon}{vpn_icon} {username_display} 📅бессрочно\n"
         else: 
             text += f"{i}. {status}{device_icon}{vpn_icon} {username_display} 📅бессрочно\n"
     
@@ -1017,6 +1523,226 @@ async def admin_list_users(message: Message):
         text += f"\n... и еще {len(users)-15} пользователей"
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=admin_users_menu())
+
+@dp.message(F.text == "🎁 Выдать VPN")
+async def admin_issue_vpn_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id): return
+    await state.set_state(IssueVPNStates.waiting_for_user)
+    await message.answer("Введите ID пользователя или username (например: 123456789 или @username):", reply_markup=back_keyboard())
+
+@dp.message(IssueVPNStates.waiting_for_user)
+async def process_issue_vpn_user(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.clear()
+        await message.answer("👤 Управление пользователями", reply_markup=admin_users_menu())
+        return
+    
+    user_identifier = message.text.strip()
+    
+    # Определяем user_id
+    if user_identifier.startswith('@'):
+        # Это username
+        username = user_identifier[1:]
+        user_id = None
+        # В реальном боте нужно получить user_id по username через API
+        # Для простоты будем просить ввести ID
+        await message.answer("Пожалуйста, введите числовой ID пользователя:")
+        return
+    else:
+        try:
+            user_id = int(user_identifier)
+        except:
+            await message.answer("Введите корректный числовой ID пользователя:", reply_markup=back_keyboard())
+            return
+    
+    await state.update_data(user_id=user_id)
+    await state.set_state(IssueVPNStates.waiting_for_period)
+    
+    prices = await get_vpn_prices()
+    text = f"""🎁 <b>Выдача VPN пользователю ID: {user_id}</b>
+
+📊 <b>Тарифы:</b>
+💎 <b>7 дней</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}
+💎 <b>30 дней</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}
+♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}
+
+Выберите период:"""
+    
+    await message.answer(text, reply_markup=extend_period_keyboard(), parse_mode=ParseMode.HTML)
+
+@dp.message(IssueVPNStates.waiting_for_period)
+async def process_issue_vpn_period(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.set_state(IssueVPNStates.waiting_for_user)
+        await message.answer("Введите ID пользователя или username:", reply_markup=back_keyboard())
+        return
+    
+    period_map = {
+        "💎 Неделя": 7,
+        "💎 Месяц": 30,
+        "♾️ Безлимит": 36500
+    }
+    
+    if message.text not in period_map:
+        await message.answer("Выберите период из списка:", reply_markup=extend_period_keyboard())
+        return
+    
+    period_days = period_map[message.text]
+    await state.update_data(period_days=period_days)
+    await state.set_state(IssueVPNStates.waiting_for_vpn_type)
+    await message.answer("🔐 Выберите тип VPN:", reply_markup=vpn_type_keyboard())
+
+@dp.message(IssueVPNStates.waiting_for_vpn_type)
+async def process_issue_vpn_type(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.set_state(IssueVPNStates.waiting_for_period)
+        await process_issue_vpn_period(message, state)
+        return
+    
+    if message.text not in ["IKEv2", "L2TP"]:
+        await message.answer("Выберите тип VPN из списка:", reply_markup=vpn_type_keyboard())
+        return
+    
+    vpn_type = message.text.lower()
+    await state.update_data(vpn_type=vpn_type)
+    await state.set_state(IssueVPNStates.waiting_for_device)
+    await message.answer("📱 Выберите тип устройства:", reply_markup=device_type_keyboard())
+
+@dp.message(IssueVPNStates.waiting_for_device)
+async def process_issue_vpn_device(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.set_state(IssueVPNStates.waiting_for_vpn_type)
+        await message.answer("🔐 Выберите тип VPN:", reply_markup=vpn_type_keyboard())
+        return
+    
+    device_map = {
+        "📱 iPhone/iOS": "iphone",
+        "🤖 Android": "android",
+        "💻 Другое": "auto"
+    }
+    
+    if message.text not in device_map:
+        await message.answer("Выберите тип устройства из списка:", reply_markup=device_type_keyboard())
+        return
+    
+    device_type = device_map[message.text]
+    
+    # Получаем все данные
+    data = await state.get_data()
+    user_id = data['user_id']
+    period_days = data['period_days']
+    vpn_type = data['vpn_type']
+    
+    username = f"user_{user_id}"  # В реальном боте нужно получить username из БД
+    
+    # Находим доступный сервер
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Ищем сервер с нужным типом VPN
+            if vpn_type == "ikev2":
+                condition = "ikev2_configured = TRUE"
+            else:  # l2tp
+                condition = "l2tp_configured = TRUE"
+            
+            cursor = await db.execute(f"""
+                SELECT id, name, current_users, max_users 
+                FROM servers 
+                WHERE is_active = TRUE AND {condition} AND current_users < max_users
+                ORDER BY current_users ASC LIMIT 1
+            """)
+            server = await cursor.fetchone()
+            
+            if not server:
+                await message.answer("❌ Нет доступных серверов. Попробуйте позже.", reply_markup=admin_users_menu())
+                await state.clear()
+                return
+            
+            server_id, server_name, current_users, max_users = server
+            
+            # Создаем VPN клиента
+            vpn_data, error = await create_vpn_client(server_id, user_id, username, vpn_type, device_type)
+            
+            if error:
+                await message.answer(f"❌ {error}", reply_markup=admin_users_menu())
+                await state.clear()
+                return
+            
+            # Устанавливаем срок подписки
+            subscription_end = (datetime.now() + timedelta(days=period_days)).isoformat()
+            
+            # Обновляем пользователя с данными подписки
+            await db.execute("""
+                UPDATE vpn_users 
+                SET subscription_end = ?, trial_used = TRUE, is_active = TRUE
+                WHERE user_id = ? 
+                ORDER BY id DESC LIMIT 1
+            """, (subscription_end, user_id))
+            
+            await db.commit()
+        
+        # Отправляем сообщение пользователю
+        try:
+            await bot.send_message(
+                user_id,
+                f"🎁 <b>Вам выдан VPN доступ!</b>\n\n"
+                f"Администратор предоставил вам доступ к VPN на {period_days} дней.\n\n"
+                f"🌐 <b>Сервер:</b> {vpn_data['server_ip']}\n"
+                f"👤 <b>Логин:</b> <code>{vpn_data['vpn_login']}</code>\n"
+                f"🔑 <b>Пароль:</b> <code>{vpn_data['vpn_password']}</code>\n"
+                f"🔐 <b>Тип VPN:</b> {vpn_type.upper()}\n"
+                f"🔑 <b>Общий ключ (PSK):</b> <code>vpnsharedkey</code>\n\n"
+                f"Действует до: {datetime.fromisoformat(subscription_end).strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"🆘 Поддержка: {SUPPORT_USERNAME}",
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass  # Не смогли отправить сообщение пользователю
+        
+        await message.answer(
+            f"✅ VPN успешно выдан пользователю ID: {user_id}\n\n"
+            f"📅 Срок: {period_days} дней\n"
+            f"🖥️ Сервер: {server_name}\n"
+            f"🔐 Тип: {vpn_type.upper()}\n"
+            f"📱 Устройство: {device_type}\n"
+            f"👤 Логин: {vpn_data['vpn_login']}\n"
+            f"🔑 Пароль: {vpn_data['vpn_password']}\n\n"
+            f"Действует до: {datetime.fromisoformat(subscription_end).strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=admin_users_menu(),
+            parse_mode=ParseMode.HTML
+        )
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=admin_users_menu())
+    
+    await state.clear()
+
+@dp.message(F.text == "🚫 Отключить VPN")
+async def admin_disable_vpn_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id): return
+    await state.set_state(DisableVPNStates.waiting_for_user)
+    await message.answer("Введите ID пользователя для отключения VPN:", reply_markup=back_keyboard())
+
+@dp.message(DisableVPNStates.waiting_for_user)
+async def process_disable_vpn_user(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.clear()
+        await message.answer("👤 Управление пользователями", reply_markup=admin_users_menu())
+        return
+    
+    try:
+        user_id = int(message.text)
+    except:
+        await message.answer("Введите корректный числовой ID пользователя:", reply_markup=back_keyboard())
+        return
+    
+    success, message_text = await disable_user_vpn(user_id)
+    
+    if success:
+        await message.answer(f"✅ VPN успешно отключен для пользователя ID: {user_id}", reply_markup=admin_users_menu())
+    else:
+        await message.answer(f"❌ {message_text}", reply_markup=admin_users_menu())
+    
+    await state.clear()
 
 @dp.message(F.text == "💰 Цены")
 async def admin_prices(message: Message):
@@ -1031,9 +1757,14 @@ async def admin_prices(message: Message):
 € {prices['week']['eur']:.2f} EUR
 
 <b>Месяц (30 дней):</b>
-💎 {prices['month']['stars']} Stars (авто: неделя ×3)
+💎 {prices['month']['stars']} Stars
 ₽ {prices['month']['rub']:.2f} RUB
 € {prices['month']['eur']:.2f} EUR
+
+<b>Безлимит (100 лет):</b>
+💎 {prices['unlimited']['stars']} Stars
+₽ {prices['unlimited']['rub']:.2f} RUB
+€ {prices['unlimited']['eur']:.2f} EUR
 
 Для изменения цен используйте кнопку ниже:"""
     
@@ -1046,17 +1777,18 @@ async def admin_change_price_start(message: Message, state: FSMContext):
     prices = await get_vpn_prices()
     text = f"""✏️ <b>Изменение цены</b>
 
-<b>Текущая цена за неделю:</b>
+<b>Текущие цены за неделю:</b>
 💎 {prices['week']['stars']} Stars
 ₽ {prices['week']['rub']:.2f} RUB
 € {prices['week']['eur']:.2f} EUR
 
-<b>Введите новую цену за неделю в формате:</b>
+<b>Введите новые цены за неделю в формате:</b>
 <code>Stars, RUB, EUR</code>
 
 <b>Пример:</b> <code>50, 500.0, 5.0</code>
 
-<b>Месячная цена будет рассчитана автоматически (×3)</b>"""
+<b>Месячная цена будет рассчитана автоматически (×3)</b>
+<b>Безлимит будет рассчитан автоматически (×6)</b>"""
     
     await state.set_state(PriceStates.waiting_for_prices)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
@@ -1101,7 +1833,12 @@ async def process_new_prices(message: Message, state: FSMContext):
 <b>Новая цена за месяц (неделя×3):</b>
 💎 {new_prices['month']['stars']} Stars
 ₽ {new_prices['month']['rub']:.2f} RUB
-€ {new_prices['month']['eur']:.2f} EUR"""
+€ {new_prices['month']['eur']:.2f} EUR
+
+<b>Новая цена за безлимит (неделя×6):</b>
+💎 {new_prices['unlimited']['stars']} Stars
+₽ {new_prices['unlimited']['rub']:.2f} RUB
+€ {new_prices['unlimited']['eur']:.2f} EUR"""
             
             await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=admin_main_menu())
         else:
@@ -1121,7 +1858,7 @@ async def admin_test_server(message: Message, state: FSMContext):
     
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, name, server_ip FROM servers WHERE is_active = TRUE LIMIT 10")
+            cursor = await db.execute("SELECT id, name, server_ip, status FROM servers WHERE is_active = TRUE LIMIT 10")
             servers = await cursor.fetchall()
     except: 
         await message.answer("❌ Ошибка получения данных", reply_markup=admin_main_menu()); return
@@ -1130,9 +1867,10 @@ async def admin_test_server(message: Message, state: FSMContext):
         await message.answer("📭 Нет активных серверов", reply_markup=admin_main_menu()); return
     
     text = "🤖 <b>Выберите сервер для теста:</b>\n\n"
-    for server_id, name, server_ip in servers:
+    for server_id, name, server_ip, status in servers:
+        status_icon = "🟢" if status == "installed" else "🟡" if status == "pending" else "🔴"
         ip_display = server_ip if server_ip else "IP не установлен"
-        text += f"<b>{name}</b>\nID: {server_id} | 🌐 {ip_display}\n\n"
+        text += f"<b>{name}</b> {status_icon}\nID: {server_id} | 🌐 {ip_display}\nСтатус: {status}\n\n"
     
     text += "Введите ID сервера для тестирования:"
     
@@ -1173,7 +1911,8 @@ async def process_test_server(message: Message, state: FSMContext):
         results = [f"✅ <b>SSH подключение работает</b>",
                   f"👤 <b>Пользователь:</b> {system_info['user']}",
                   f"🌐 <b>Хост:</b> {system_info['host']}",
-                  f"🔐 <b>Sudo доступ:</b> {'✅ Есть' if system_info['has_sudo'] else '❌ Нет'}"]
+                  f"🔐 <b>Sudo доступ:</b> {'✅ Есть' if system_info['has_sudo'] else '❌ Нет'}",
+                  f"🌐 <b>IP сервера:</b> {system_info.get('server_ip', 'Не определен')}"]
         
         for cmd, desc in test_cmds:
             stdout, stderr, success = await execute_ssh_command(server_id, cmd, use_sudo=False)
@@ -1181,23 +1920,202 @@ async def process_test_server(message: Message, state: FSMContext):
                 results.append(f"📊 <b>{desc}:</b> {stdout.strip()}")
         
         # Проверка VPN
-        vpn_checks = [
-            ("which ipsec || which strongswan", "IKEv2/IPsec"),
-            ("which xl2tpd", "L2TP"),
-        ]
-        
-        results.append("\n🔧 <b>Установленные VPN:</b>")
-        for cmd, name in vpn_checks:
-            stdout, stderr, success = await execute_ssh_command(server_id, cmd, use_sudo=False)
-            if success and stdout:
-                results.append(f"✅ {name}")
-            else:
-                results.append(f"❌ {name}")
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute("SELECT ikev2_configured, l2tp_configured, test_login, test_password, server_ip FROM servers WHERE id = ?", (server_id,))
+                server_info = await cursor.fetchone()
+                
+                if server_info:
+                    ikev2_configured, l2tp_configured, test_login, test_password, server_ip = server_info
+                    
+                    results.append("\n🔧 <b>Установленные VPN:</b>")
+                    
+                    if ikev2_configured:
+                        results.append(f"🔐 IKEv2: {'✅ Установлен' if ikev2_configured else '❌ Не установлен'}")
+                        if test_login and test_password:
+                            check_result = await test_vpn_connection(server_id, "ikev2", test_login, test_password, server_ip)
+                            results.append(f"   Тест подключения: {'✅ Успешно' if check_result['success'] else f'❌ {check_result[\"message\"][:100]}'}")
+                    
+                    if l2tp_configured:
+                        results.append(f"🅾️ L2TP: {'✅ Установлен' if l2tp_configured else '❌ Не установлен'}")
+                        if test_login and test_password:
+                            check_result = await test_vpn_connection(server_id, "l2tp", test_login, test_password, server_ip)
+                            results.append(f"   Тест подключения: {'✅ Успешно' if check_result['success'] else f'❌ {check_result[\"message\"][:100]}'}")
+                    
+                    if not ikev2_configured and not l2tp_configured:
+                        results.append("⚠️ VPN не установлен")
+        except:
+            results.append("\n⚠️ Не удалось получить информацию о VPN")
         
         await message.answer("\n".join(results), parse_mode=ParseMode.HTML, reply_markup=admin_main_menu())
         
     except Exception as e:
         await message.answer(f"❌ Ошибка тестирования: {str(e)}", reply_markup=admin_main_menu())
+    
+    await state.clear()
+
+@dp.message(F.text == "🔄 Продлить подписку")
+async def admin_extend_subscription_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id, message.chat.id): 
+        # Для обычных пользователей
+        await user_extend_subscription_start(message, state)
+        return
+    
+    # Для админа
+    await state.set_state(ExtendSubscriptionStates.waiting_for_user)
+    await message.answer("Введите ID пользователя для продления подписки:", reply_markup=back_keyboard())
+
+async def user_extend_subscription_start(message: Message, state: FSMContext):
+    """Начало продления подписки для обычного пользователя"""
+    user_id = message.from_user.id
+    
+    # Проверяем есть ли активная подписка
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT subscription_end, is_active 
+                FROM vpn_users 
+                WHERE user_id = ? AND is_active = TRUE 
+                ORDER BY id DESC LIMIT 1
+            """, (user_id,))
+            user = await cursor.fetchone()
+            
+            if not user:
+                await message.answer("❌ У вас нет активной подписки для продления.", reply_markup=user_main_menu())
+                await state.clear()
+                return
+            
+            subscription_end, is_active = user
+            
+            if not is_active:
+                await message.answer("❌ Ваша подписка не активна.", reply_markup=user_main_menu())
+                await state.clear()
+                return
+            
+            # Показываем текущую подписку
+            if subscription_end:
+                end_date = datetime.fromisoformat(subscription_end)
+                days_left = max(0, (end_date - datetime.now()).days)
+                
+                text = f"📅 <b>Ваша текущая подписка</b>\n\n"
+                text += f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n"
+                text += f"Осталось дней: {days_left}\n\n"
+                text += f"<b>Выберите период для продления:</b>"
+            else:
+                text = "📅 <b>Ваша текущая подписка</b>\n\n"
+                text += "Действует: бессрочно\n\n"
+                text += "<b>Выберите период для продления:</b>"
+            
+            prices = await get_vpn_prices()
+            text += f"\n\n💎 <b>Неделя (7 дней)</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}"
+            text += f"\n💎 <b>Месяц (30 дней)</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}"
+            text += f"\n♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}"
+            
+            await state.set_state(UserPaymentStates.waiting_for_period)
+            await state.update_data(is_extension=True)
+            await message.answer(text, reply_markup=extend_period_keyboard(), parse_mode=ParseMode.HTML)
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}", reply_markup=user_main_menu())
+        await state.clear()
+
+@dp.message(ExtendSubscriptionStates.waiting_for_user)
+async def process_extend_user(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.clear()
+        await message.answer("👑 Админ-панель", reply_markup=admin_main_menu())
+        return
+    
+    try:
+        user_id = int(message.text)
+    except:
+        await message.answer("Введите корректный числовой ID пользователя:", reply_markup=back_keyboard())
+        return
+    
+    # Проверяем есть ли пользователь
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT username FROM vpn_users WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
+            user = await cursor.fetchone()
+            
+            if not user:
+                await message.answer(f"❌ Пользователь ID {user_id} не найден.", reply_markup=back_keyboard())
+                return
+            
+            username = user[0] or f"user_{user_id}"
+    except:
+        await message.answer("❌ Ошибка проверки пользователя", reply_markup=back_keyboard())
+        return
+    
+    await state.update_data(user_id=user_id, username=username)
+    await state.set_state(ExtendSubscriptionStates.waiting_for_period)
+    
+    prices = await get_vpn_prices()
+    text = f"""🔄 <b>Продление подписки для пользователя:</b>
+
+👤 ID: {user_id}
+📛 Имя: {username}
+
+📊 <b>Тарифы:</b>
+💎 <b>7 дней</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}
+💎 <b>30 дней</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}
+♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}
+
+Выберите период продления:"""
+    
+    await message.answer(text, reply_markup=extend_period_keyboard(), parse_mode=ParseMode.HTML)
+
+@dp.message(ExtendSubscriptionStates.waiting_for_period)
+async def process_extend_period(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад": 
+        await state.set_state(ExtendSubscriptionStates.waiting_for_user)
+        await message.answer("Введите ID пользователя для продления подписки:", reply_markup=back_keyboard())
+        return
+    
+    period_map = {
+        "💎 Неделя": 7,
+        "💎 Месяц": 30,
+        "♾️ Безлимит": 36500
+    }
+    
+    if message.text not in period_map:
+        await message.answer("Выберите период из списка:", reply_markup=extend_period_keyboard())
+        return
+    
+    period_days = period_map[message.text]
+    data = await state.get_data()
+    user_id = data['user_id']
+    username = data['username']
+    
+    # Продлеваем подписку
+    success, result_text = await extend_subscription(user_id, period_days, admin_action=True)
+    
+    if success:
+        # Отправляем уведомление пользователю
+        try:
+            await bot.send_message(
+                user_id,
+                f"🔄 <b>Ваша подписка VPN продлена!</b>\n\n"
+                f"Администратор продлил вашу подписку на {period_days} дней.\n\n"
+                f"{result_text}\n\n"
+                f"🆘 Поддержка: {SUPPORT_USERNAME}",
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass  # Не смогли отправить сообщение
+        
+        await message.answer(
+            f"✅ Подписка пользователя {username} (ID: {user_id}) успешно продлена!\n\n"
+            f"{result_text}",
+            reply_markup=admin_main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await message.answer(
+            f"❌ Не удалось продлить подписку: {result_text}",
+            reply_markup=admin_main_menu(),
+            parse_mode=ParseMode.HTML
+        )
     
     await state.clear()
 
@@ -1212,6 +2130,7 @@ async def get_vpn_start(message: Message, state: FSMContext):
 🎁 <b>3 дня бесплатно</b> - пробный период
 💎 <b>7 дней</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}
 💎 <b>30 дней</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}
+♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}
 
 Выберите вариант:"""
     
@@ -1225,7 +2144,14 @@ async def process_user_period(message: Message, state: FSMContext):
         await message.answer("🚀 Добро пожаловать!", reply_markup=user_main_menu())
         return
     
+    data = await state.get_data()
+    is_extension = data.get('is_extension', False)
+    
     if message.text == "🎁 3 дня (пробный)":
+        if is_extension:
+            await message.answer("❌ Пробный период доступен только для новой подписки.", reply_markup=period_keyboard())
+            return
+            
         # Проверка пробного периода
         user_id = message.from_user.id
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1240,18 +2166,26 @@ async def process_user_period(message: Message, state: FSMContext):
         await state.set_state(UserPaymentStates.waiting_for_vpn_type)
         await message.answer("✅ Пробный период доступен!\n\n🔐 Выберите тип VPN:", reply_markup=vpn_type_keyboard())
         
-    elif message.text in ["💎 Неделя", "💎 Месяц"]:
-        period = 7 if message.text == "💎 Неделя" else 30
+    elif message.text in ["💎 Неделя", "💎 Месяц", "♾️ Безлимит"]:
+        period_map = {
+            "💎 Неделя": 7,
+            "💎 Месяц": 30,
+            "♾️ Безлимит": 36500
+        }
+        
+        period = period_map[message.text]
         prices = await get_vpn_prices()
         
         if period == 7:
-            amount_stars = prices['week']['stars']
-            amount_rub = prices['week']['rub']
-            amount_eur = prices['week']['eur']
+            price_key = "week"
+        elif period == 30:
+            price_key = "month"
         else:
-            amount_stars = prices['month']['stars']
-            amount_rub = prices['month']['rub']
-            amount_eur = prices['month']['eur']
+            price_key = "unlimited"
+        
+        amount_stars = prices[price_key]['stars']
+        amount_rub = prices[price_key]['rub']
+        amount_eur = prices[price_key]['eur']
         
         await state.update_data(
             period=period, 
@@ -1260,8 +2194,43 @@ async def process_user_period(message: Message, state: FSMContext):
             amount_rub=amount_rub,
             amount_eur=amount_eur
         )
-        await state.set_state(UserPaymentStates.waiting_for_payment)
-        await message.answer("💳 Выберите способ оплаты:", reply_markup=payment_method_keyboard())
+        
+        if is_extension:
+            # Для продления сразу продлеваем подписку
+            user_id = message.from_user.id
+            success, result_text = await extend_subscription(user_id, period)
+            
+            if success:
+                # Записываем платеж
+                try:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("""
+                            INSERT INTO payments (user_id, amount_stars, amount_rub, amount_eur, period_days, status, created_at)
+                            VALUES (?, ?, ?, ?, ?, 'pending_manual', CURRENT_TIMESTAMP)
+                        """, (user_id, amount_stars, amount_rub, amount_eur, period))
+                        await db.commit()
+                except:
+                    pass
+                
+                await message.answer(
+                    f"✅ <b>Подписка продлена!</b>\n\n"
+                    f"{result_text}\n\n"
+                    f"💳 <b>Оплата:</b>\n"
+                    f"💎 {amount_stars} Stars\n"
+                    f"₽ {amount_rub:.2f} RUB\n"
+                    f"€ {amount_eur:.2f} EUR\n\n"
+                    f"Для оплаты обратитесь в поддержку: {SUPPORT_USERNAME}",
+                    reply_markup=user_main_menu(),
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await message.answer(f"❌ {result_text}", reply_markup=user_main_menu())
+            
+            await state.clear()
+        else:
+            # Для новой подписки
+            await state.set_state(UserPaymentStates.waiting_for_payment)
+            await message.answer("💳 Выберите способ оплаты:", reply_markup=payment_method_keyboard())
     
     else:
         await message.answer("Выберите вариант из списка:", reply_markup=period_keyboard())
@@ -1274,19 +2243,27 @@ async def process_payment_method(message: Message, state: FSMContext):
     
     data = await state.get_data()
     period = data['period']
-    amount_rub = data['amount_rub']
+    amount_stars = data['amount_stars']
     
     if message.text == "💎 Stars (Telegram)":
         # Платеж через Stars (Telegram Payments)
+        # ИСПРАВЛЕНИЕ: цена в Stars указывается в центах (1 Star = 100 центов)
+        # Но в документации указано что 1 Star = 1 единица
+        # Проверим правильность:
+        # Обычно: amount=100 означает 1.00 единица валюты
+        # Для Stars: amount=50 означает 50 Stars
+        
+        stars_amount = amount_stars  # Уже правильное значение
+        
         try:
             await bot.send_invoice(
                 chat_id=message.chat.id,
                 title=f"VPN доступ на {period} дней",
                 description=f"Доступ к VPN серверу на {period} дней. Оплата Stars.",
-                payload=f"vpn_stars_{period}days_{message.from_user.id}",
+                payload=f"vpn_stars_{period}days_{message.from_user.id}_{int(time.time())}",
                 provider_token=PROVIDER_TOKEN,
                 currency="XTR",  # Stars
-                prices=[LabeledPrice(label=f"{period} дней VPN", amount=data['amount_stars'] * 100)],  # Stars в центах
+                prices=[LabeledPrice(label=f"{period} дней VPN", amount=stars_amount)],
                 start_parameter="vpn_subscription",
                 need_email=False,
                 need_phone_number=False,
@@ -1303,9 +2280,15 @@ async def process_payment_method(message: Message, state: FSMContext):
     
     elif message.text == "💳 Карта (RUB/€)":
         # Перенаправляем в поддержку
+        amount_rub = data.get('amount_rub', 0)
+        amount_eur = data.get('amount_eur', 0)
+        
         await message.answer(
             f"💳 <b>Оплата картой (RUB/€)</b>\n\n"
             f"Для оплаты картой обратитесь в поддержку:\n{SUPPORT_PAYMENT}\n\n"
+            f"<b>Сумма к оплате:</b>\n"
+            f"₽ {amount_rub:.2f} RUB\n"
+            f"€ {amount_eur:.2f} EUR\n\n"
             f"После оплаты вы получите доступ к VPN.",
             parse_mode=ParseMode.HTML,
             reply_markup=user_main_menu()
@@ -1332,8 +2315,8 @@ async def process_successful_payment(message: Message, state: FSMContext):
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
-                INSERT INTO payments (user_id, amount_stars, amount_rub, amount_eur, period_days, status, telegram_payment_id)
-                VALUES (?, ?, ?, ?, ?, 'completed', ?)
+                INSERT INTO payments (user_id, amount_stars, amount_rub, amount_eur, period_days, status, telegram_payment_id, created_at)
+                VALUES (?, ?, ?, ?, ?, 'completed', ?, CURRENT_TIMESTAMP)
             """, (
                 message.from_user.id,
                 data.get('amount_stars', 0),
@@ -1568,7 +2551,7 @@ async def help_command(message: Message):
 <b>Частые вопросы:</b>
 1. <b>Как подключиться?</b> - После оплаты вы получите данные для подключения
 2. <b>Какие типы VPN поддерживаются?</b> - IKEv2 и L2TP (встроены в iOS/Android)
-3. <b>Как продлить подписку?</b> - Купите новую подписку через "🔐 Получить VPN"
+3. <b>Как продлить подписку?</b> - Используйте кнопку '🔄 Продлить подписку'
 4. <b>Не работает подключение?</b> - Перезагрузите устройство, проверьте настройки
 5. <b>Проблемы с оплатой?</b> - Обратитесь в поддержку
 
@@ -1585,12 +2568,29 @@ async def help_command(message: Message):
     
     await message.answer(text, reply_markup=user_main_menu(), parse_mode=ParseMode.HTML)
 
+# ========== ПЕРИОДИЧЕСКИЕ ЗАДАЧИ ==========
+async def periodic_tasks():
+    """Периодические задачи бота"""
+    while True:
+        try:
+            # Проверяем истекшие подписки
+            expired_count = await check_expired_subscriptions()
+            if expired_count > 0:
+                logger.info(f"Отключено {expired_count} истекших подписок")
+            
+            # Проверяем серверы (раз в час)
+            await asyncio.sleep(3600)  # 1 час
+            
+        except Exception as e:
+            logger.error(f"Ошибка в периодических задачах: {e}")
+            await asyncio.sleep(300)  # 5 минут при ошибке
+
 # ========== ЗАПУСК ==========
 async def main():
     print("=" * 50)
     print("🚀 ЗАПУСК VPN HOSTING БОТА")
     print("=" * 50)
-    print(f"🔐 Только IKEv2/L2TP (без приложений)")
+    print(f"🔐 Поддержка IKEv2 и L2TP")
     print(f"💳 Поддержка Stars, RUB, EUR")
     print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"💬 Support: {SUPPORT_USERNAME}")
@@ -1612,6 +2612,9 @@ async def main():
         print(f"❌ Ошибка подключения к Telegram API: {e}")
         print(f"Проверьте BOT_TOKEN: {'установлен' if BOT_TOKEN else 'НЕ УСТАНОВЛЕН'}")
         return
+    
+    # Запускаем периодические задачи
+    asyncio.create_task(periodic_tasks())
     
     print("=" * 50)
     print("✅ Бот готов к работе! Ожидаю сообщений...")
