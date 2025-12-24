@@ -1380,11 +1380,13 @@ async def recheck_all_servers(message: Message):
         
         if ikev2_configured and test_login and test_password:
             check_result = await test_vpn_connection(server_id, "ikev2", test_login, test_password, server_ip)
-            result_text += f"🔐 IKEv2: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+            status = "✅ Работает" if check_result['success'] else f"❌ Проблемы: {check_result['message'][:100]}"
+            result_text += f"🔐 IKEv2: {status}\n"
         
         if l2tp_configured and test_login and test_password:
             check_result = await test_vpn_connection(server_id, "l2tp", test_login, test_password, server_ip)
-            result_text += f"🅾️ L2TP: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+            status = "✅ Работает" if check_result['success'] else f"❌ Проблемы: {check_result['message'][:100]}"
+            result_text += f"🅾️ L2TP: {status}\n"
         
         if not ikev2_configured and not l2tp_configured:
             result_text += "❌ VPN не установлен\n"
@@ -1455,11 +1457,13 @@ async def process_recheck_server(message: Message, state: FSMContext):
         
         if ikev2_configured and test_login and test_password:
             check_result = await test_vpn_connection(server_id, "ikev2", test_login, test_password, server_ip)
-            result_text += f"🔐 IKEv2: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+            status = "✅ Работает" if check_result['success'] else f"❌ Проблемы: {check_result['message'][:100]}"
+            result_text += f"🔐 IKEv2: {status}\n"
         
         if l2tp_configured and test_login and test_password:
             check_result = await test_vpn_connection(server_id, "l2tp", test_login, test_password, server_ip)
-            result_text += f"🅾️ L2TP: {'✅ Работает' if check_result['success'] else f'❌ Проблемы: {check_result[\"message\"]}'}\n"
+            status = "✅ Работает" if check_result['success'] else f"❌ Проблемы: {check_result['message'][:100]}"
+            result_text += f"🅾️ L2TP: {status}\n"
         
         if not ikev2_configured and not l2tp_configured:
             result_text += "❌ VPN не установлен\n"
@@ -1534,7 +1538,7 @@ async def admin_issue_vpn_start(message: Message, state: FSMContext):
 async def process_issue_vpn_user(message: Message, state: FSMContext):
     if message.text == "◀️ Назад": 
         await state.clear()
-        await message.answer("👤 Управление пользователями", reply_markup=admin_users_menu())
+        await message.answer("👤 Управление пользователей", reply_markup=admin_users_menu())
         return
     
     user_identifier = message.text.strip()
@@ -1881,7 +1885,7 @@ async def admin_test_server(message: Message, state: FSMContext):
 async def process_test_server(message: Message, state: FSMContext):
     if message.text == "◀️ Назад": 
         await state.clear()
-        await message.answer("👑 Админ-панель", reply_markup=admin_main_menu())
+        await message.answer("👑 Админ/панель", reply_markup=admin_main_menu())
         return
     
     try: 
@@ -1934,13 +1938,15 @@ async def process_test_server(message: Message, state: FSMContext):
                         results.append(f"🔐 IKEv2: {'✅ Установлен' if ikev2_configured else '❌ Не установлен'}")
                         if test_login and test_password:
                             check_result = await test_vpn_connection(server_id, "ikev2", test_login, test_password, server_ip)
-                            results.append(f"   Тест подключения: {'✅ Успешно' if check_result['success'] else f'❌ {check_result[\"message\"][:100]}'}")
+                            status = "✅ Успешно" if check_result['success'] else f"❌ {check_result['message'][:100]}"
+                            results.append(f"   Тест подключения: {status}")
                     
                     if l2tp_configured:
                         results.append(f"🅾️ L2TP: {'✅ Установлен' if l2tp_configured else '❌ Не установлен'}")
                         if test_login and test_password:
                             check_result = await test_vpn_connection(server_id, "l2tp", test_login, test_password, server_ip)
-                            results.append(f"   Тест подключения: {'✅ Успешно' if check_result['success'] else f'❌ {check_result[\"message\"][:100]}'}")
+                            status = "✅ Успешно" if check_result['success'] else f"❌ {check_result['message'][:100]}"
+                            results.append(f"   Тест подключения: {status}")
                     
                     if not ikev2_configured and not l2tp_configured:
                         results.append("⚠️ VPN не установлен")
@@ -2023,7 +2029,7 @@ async def user_extend_subscription_start(message: Message, state: FSMContext):
 async def process_extend_user(message: Message, state: FSMContext):
     if message.text == "◀️ Назад": 
         await state.clear()
-        await message.answer("👑 Админ-панель", reply_markup=admin_main_menu())
+        await message.answer("👑 Админ/панель", reply_markup=admin_main_menu())
         return
     
     try:
