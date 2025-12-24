@@ -19,7 +19,7 @@ SUPPORT_USERNAME = "@vpnhostik"
 DATA_DIR = "/data"
 if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
-PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN", "381764678:TEST:85560")  # Токен для платежей
+PROVIDER_TOKEN = os.getenv("5775769170:LIVE:TG_ADz_HW287D54Wfd3pqBi_BQA")  # Токен для платежей
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
