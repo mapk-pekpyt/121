@@ -1,4 +1,4 @@
-# main.py - VPN БОТ С XRAY REALITY (ПОЛНАЯ ВЕРСИЯ)
+# main.py - VPN БОТ С XRAY REALITY (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 import os, asyncio, logging, sys, random, sqlite3, time, json, re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -46,7 +46,7 @@ except Exception as e:
 
 dp = Dispatcher(storage=MemoryStorage())
 
-# ========== БАЗА ДАННЫХ ==========
+# ========== БАЗА ДАННЫХ - ИСПРАВЛЕННАЯ ==========
 async def init_database():
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -103,61 +103,25 @@ async def init_database():
                 week_eur REAL DEFAULT 5.0,
                 month_stars INTEGER DEFAULT 150,
                 month_rub REAL DEFAULT 1500.0,
-                month_eur REAL DEFAULT 15.0,
-                unlimited_stars INTEGER DEFAULT 300,
-                unlimited_rub REAL DEFAULT 3000.0,
-                unlimited_eur REAL DEFAULT 30.0)""")
+                month_eur REAL DEFAULT 15.0)""")
             
-            # Начальные цены
+            # Начальные цены (без безлимита)
             await db.execute("""INSERT OR IGNORE INTO prices (id, week_stars, week_rub, week_eur, 
-                month_stars, month_rub, month_eur, unlimited_stars, unlimited_rub, unlimited_eur) 
-                VALUES (1, 50, 500.0, 5.0, 150, 1500.0, 15.0, 300, 3000.0, 30.0)""")
-            
-            # Проверяем и обновляем структуру если нужно
-            cursor = await db.execute("PRAGMA table_info(servers)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            # Добавляем недостающие колонки
-            if 'xray_configured' not in column_names:
-                await db.execute("ALTER TABLE servers ADD COLUMN xray_configured BOOLEAN DEFAULT FALSE")
-            if 'xray_public_key' not in column_names:
-                await db.execute("ALTER TABLE servers ADD COLUMN xray_public_key TEXT")
-            
-            # Удаляем старые колонки IKEv2/L2TP если они есть
-            if 'ikev2_configured' in column_names:
-                # Создаем новую таблицу без старых колонок
-                await db.execute("""
-                    CREATE TABLE servers_new AS 
-                    SELECT id, name, ssh_key, connection_string, max_users, current_users, 
-                           is_active, server_ip, xray_configured, xray_public_key,
-                           last_check, status, created_at 
-                    FROM servers
-                """)
-                await db.execute("DROP TABLE servers")
-                await db.execute("ALTER TABLE servers_new RENAME TO servers")
-            
-            # Обновляем таблицу пользователей
-            cursor = await db.execute("PRAGMA table_info(vpn_users)")
-            user_columns = await cursor.fetchall()
-            user_column_names = [col[1] for col in user_columns]
-            
-            if 'vpn_uuid' not in user_column_names:
-                # Переименовываем vpn_login в vpn_uuid
-                if 'vpn_login' in user_column_names:
-                    await db.execute("ALTER TABLE vpn_users RENAME COLUMN vpn_login TO vpn_uuid")
-                else:
-                    await db.execute("ALTER TABLE vpn_users ADD COLUMN vpn_uuid TEXT UNIQUE")
-            
-            if 'vpn_password' in user_column_names:
-                await db.execute("ALTER TABLE vpn_users DROP COLUMN vpn_password")
+                month_stars, month_rub, month_eur) 
+                VALUES (1, 50, 500.0, 5.0, 150, 1500.0, 15.0)""")
             
             await db.commit()
             logger.info("✅ База данных инициализирована (XRay Reality)")
             return True
     except Exception as e:
         logger.error(f"❌ Ошибка БД: {e}")
-        return False
+        # Попробуем создать с нуля
+        try:
+            if os.path.exists(DB_PATH):
+                os.remove(DB_PATH)
+            return await init_database()
+        except:
+            return False
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def is_admin(user_id: int, chat_id: int = None) -> bool:
@@ -168,47 +132,35 @@ async def get_vpn_prices() -> Dict:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""SELECT week_stars, week_rub, week_eur, 
-                month_stars, month_rub, month_eur, unlimited_stars, unlimited_rub, unlimited_eur 
-                FROM prices WHERE id = 1""")
+                month_stars, month_rub, month_eur FROM prices WHERE id = 1""")
             prices = await cursor.fetchone()
             if prices: 
                 return {
                     "week": {"days": 7, "stars": prices[0], "rub": prices[1], "eur": prices[2]},
-                    "month": {"days": 30, "stars": prices[3], "rub": prices[4], "eur": prices[5]},
-                    "unlimited": {"days": 36500, "stars": prices[6], "rub": prices[7], "eur": prices[8]}
+                    "month": {"days": 30, "stars": prices[3], "rub": prices[4], "eur": prices[5]}
                 }
     except Exception as e:
         logger.error(f"Ошибка получения цен: {e}")
     
     return {
         "week": {"days": 7, "stars": 50, "rub": 500.0, "eur": 5.0},
-        "month": {"days": 30, "stars": 150, "rub": 1500.0, "eur": 15.0},
-        "unlimited": {"days": 36500, "stars": 300, "rub": 3000.0, "eur": 30.0}
+        "month": {"days": 30, "stars": 150, "rub": 1500.0, "eur": 15.0}
     }
 
-async def update_prices(week_stars: int, week_rub: float, week_eur: float, unlimited_stars: int = None, unlimited_rub: float = None, unlimited_eur: float = None):
+async def update_prices(week_stars: int, week_rub: float, week_eur: float):
     """Обновление цен"""
     try:
         month_stars = week_stars * 3
         month_rub = week_rub * 3
         month_eur = week_eur * 3
         
-        if unlimited_stars is None:
-            unlimited_stars = week_stars * 6
-        if unlimited_rub is None:
-            unlimited_rub = week_rub * 6
-        if unlimited_eur is None:
-            unlimited_eur = week_eur * 6
-        
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
                 UPDATE prices SET 
                 week_stars = ?, week_rub = ?, week_eur = ?,
-                month_stars = ?, month_rub = ?, month_eur = ?,
-                unlimited_stars = ?, unlimited_rub = ?, unlimited_eur = ?
+                month_stars = ?, month_rub = ?, month_eur = ?
                 WHERE id = 1
-            """, (week_stars, week_rub, week_eur, month_stars, month_rub, month_eur, 
-                  unlimited_stars, unlimited_rub, unlimited_eur))
+            """, (week_stars, week_rub, week_eur, month_stars, month_rub, month_eur))
             await db.commit()
         return True
     except Exception as e:
@@ -324,9 +276,9 @@ async def execute_ssh_command(server_id: int, command: str, timeout: int = 60, u
     except Exception as e:
         return "", f"Ошибка выполнения: {str(e)}", False
 
-# ========== XRAY REALITY УСТАНОВКА И УПРАВЛЕНИЕ ==========
+# ========== XRAY REALITY УСТАНОВКА И УПРАВЛЕНИЕ - ИСПРАВЛЕННАЯ ==========
 async def setup_xray_vpn(server_id: int, message: Message):
-    """Установка XRay с Reality на сервер"""
+    """Установка XRay с Reality на сервер - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     await message.answer("🚀 Начинаю установку XRay Reality...")
     
     ssh_ok, ssh_msg, system_info = await check_ssh_connection(server_id)
@@ -341,44 +293,110 @@ async def setup_xray_vpn(server_id: int, message: Message):
     try:
         server_ip = system_info.get('server_ip', '')
         
-        # Команды установки XRay
-        install_cmds = [
+        # Шаг 1: Проверяем и обновляем систему
+        await message.answer("🔄 Шаг 1/5: Проверяю и обновляю систему...")
+        
+        system_cmds = [
             "apt-get update -y",
-            "apt-get install -y curl wget",
-            "bash -c \"$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install",
-            "mkdir -p /usr/local/etc/xray",
-            "touch /usr/local/etc/xray/users.json",
-            'echo "{}" > /usr/local/etc/xray/users.json',
-            "systemctl enable xray",
-            "systemctl start xray"
+            "apt-get upgrade -y",
+            "apt-get install -y curl wget git jq",
+            "which xray && echo 'XRAY_EXISTS' || echo 'NO_XRAY'"
         ]
         
-        for cmd in install_cmds:
-            stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=180, use_sudo=True)
-            if not success:
-                await message.answer(f"⚠️ Предупреждение при установке: {stderr[:200]}")
+        for cmd in system_cmds:
+            stdout, stderr, success = await execute_ssh_command(server_id, cmd, timeout=300, use_sudo=True)
+            if "NO_XRAY" in stdout:
+                xray_exists = False
+            elif "XRAY_EXISTS" in stdout:
+                xray_exists = True
         
-        # Генерация ключей Reality
-        await message.answer("🔑 Генерирую ключи Reality...")
-        keygen_cmd = "xray x25519"
+        # Шаг 2: Установка XRay
+        await message.answer("📦 Шаг 2/5: Устанавливаю XRay...")
+        
+        if not xray_exists:
+            # Пробуем разные методы установки
+            install_methods = [
+                "bash -c \"$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install -u root",
+                "bash -c \"$(wget -qO- https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install -u root",
+                "curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- install -u root"
+            ]
+            
+            installed = False
+            for install_cmd in install_methods:
+                stdout, stderr, success = await execute_ssh_command(server_id, install_cmd, timeout=300, use_sudo=True)
+                if success:
+                    installed = True
+                    break
+            
+            if not installed:
+                await message.answer("❌ Не удалось установить XRay")
+                return False
+        
+        # Шаг 3: Создаем необходимые директории с правильными правами
+        await message.answer("📁 Шаг 3/5: Настраиваю директории и права...")
+        
+        dir_cmds = [
+            "mkdir -p /usr/local/etc/xray",
+            "mkdir -p /var/log/xray",
+            "chown -R root:root /usr/local/etc/xray",
+            "chown -R root:root /var/log/xray",
+            "chmod 755 /usr/local/etc/xray",
+            "chmod 755 /var/log/xray",
+            "touch /usr/local/etc/xray/users.json",
+            "chown root:root /usr/local/etc/xray/users.json",
+            "chmod 644 /usr/local/etc/xray/users.json",
+            "echo '{}' > /usr/local/etc/xray/users.json"
+        ]
+        
+        for cmd in dir_cmds:
+            await execute_ssh_command(server_id, cmd, use_sudo=True)
+        
+        # Шаг 4: Генерация ключей Reality
+        await message.answer("🔑 Шаг 4/5: Генерирую ключи Reality...")
+        
+        keygen_cmd = "/usr/local/bin/xray x25519 2>/dev/null || xray x25519"
         stdout, stderr, success = await execute_ssh_command(server_id, keygen_cmd, use_sudo=True)
+        
+        if not success or not stdout:
+            # Пробуем альтернативный метод генерации
+            keygen_cmd = "xray x25519"
+            stdout, stderr, success = await execute_ssh_command(server_id, keygen_cmd, use_sudo=True)
         
         if not success or not stdout:
             await message.answer("❌ Ошибка генерации ключей XRay")
             return False
         
         # Парсим приватный и публичный ключи
-        private_key_match = re.search(r'PrivateKey:\s*([A-Za-z0-9_-]+)', stdout)
-        public_key_match = re.search(r'PublicKey:\s*([A-Za-z0-9_-]+)', stdout)
+        private_key = None
+        public_key = None
         
-        if not private_key_match or not public_key_match:
+        for line in stdout.split('\n'):
+            if 'Private key:' in line:
+                private_key = line.split(':')[1].strip()
+            elif 'PrivateKey:' in line:
+                private_key = line.split(':')[1].strip()
+            elif 'Public key:' in line:
+                public_key = line.split(':')[1].strip()
+            elif 'PublicKey:' in line:
+                public_key = line.split(':')[1].strip()
+        
+        if not private_key or not public_key:
+            # Пробуем другой формат парсинга
+            private_key_match = re.search(r'Private[ _-]?[Kk]ey:\s*([A-Za-z0-9_-]+)', stdout)
+            public_key_match = re.search(r'Public[ _-]?[Kk]ey:\s*([A-Za-z0-9_-]+)', stdout)
+            
+            if private_key_match:
+                private_key = private_key_match.group(1)
+            if public_key_match:
+                public_key = public_key_match.group(1)
+        
+        if not private_key or not public_key:
             await message.answer("❌ Не удалось распознать сгенерированные ключи")
             return False
         
-        private_key = private_key_match.group(1)
-        public_key = public_key_match.group(1)
+        # Шаг 5: Создаем конфиг XRay
+        await message.answer("⚙️ Шаг 5/5: Создаю конфигурацию XRay...")
         
-        # Создаем конфиг XRay
         config_template = {
             "log": {
                 "loglevel": "warning",
@@ -421,29 +439,56 @@ async def setup_xray_vpn(server_id: int, message: Message):
         stdout, stderr, success = await execute_ssh_command(server_id, config_cmd, use_sudo=True)
         
         if not success:
-            await message.answer(f"❌ Ошибка записи конфига: {stderr}")
+            await message.answer(f"❌ Ошибка записи конфига: {stderr[:200]}")
             return False
         
         # Сохраняем публичный ключ в файл
-        pubkey_cmd = f"echo '{public_key}' > /usr/local/etc/xray/public_key.txt"
+        pubkey_cmd = f"echo '{public_key}' > /usr/local/etc/xray/public_key.txt && chmod 644 /usr/local/etc/xray/public_key.txt"
         await execute_ssh_command(server_id, pubkey_cmd, use_sudo=True)
         
-        # Перезапускаем XRay
-        restart_cmd = "systemctl restart xray"
-        stdout, stderr, success = await execute_ssh_command(server_id, restart_cmd, use_sudo=True)
+        # Устанавливаем права на конфиг
+        chmod_cmd = "chown root:root /usr/local/etc/xray/config.json && chmod 644 /usr/local/etc/xray/config.json"
+        await execute_ssh_command(server_id, chmod_cmd, use_sudo=True)
         
-        if not success:
-            await message.answer(f"⚠️ XRay перезапущен с предупреждением: {stderr[:200]}")
+        # Шаг 6: Запускаем XRay
+        await message.answer("🚀 Запускаю XRay...")
+        
+        start_cmds = [
+            "systemctl daemon-reload",
+            "systemctl enable xray",
+            "systemctl restart xray",
+            "sleep 3"
+        ]
+        
+        for cmd in start_cmds:
+            await execute_ssh_command(server_id, cmd, use_sudo=True)
         
         # Проверяем что XRay работает
-        check_cmd = "systemctl is-active xray"
+        await message.answer("🔍 Проверяю работу XRay...")
+        check_cmd = "systemctl is-active xray && echo 'ACTIVE'"
         stdout, stderr, success = await execute_ssh_command(server_id, check_cmd, use_sudo=True)
         
-        if stdout.strip() != "active":
-            await message.answer("⚠️ XRay установлен, но служба не активна")
-            xray_ok = False
+        if "ACTIVE" not in stdout:
+            # Пробуем перезапустить
+            await execute_ssh_command(server_id, "systemctl restart xray", use_sudo=True)
+            await asyncio.sleep(3)
+            
+            stdout, stderr, success = await execute_ssh_command(server_id, check_cmd, use_sudo=True)
+            
+            if "ACTIVE" not in stdout:
+                await message.answer("⚠️ XRay установлен, но служба не активна")
+                xray_ok = False
+            else:
+                xray_ok = True
         else:
             xray_ok = True
+        
+        # Проверяем порт
+        port_check = "ss -tln | grep ':443 ' || netstat -tln | grep ':443 ' || echo 'PORT_NOT_OPEN'"
+        stdout, stderr, success = await execute_ssh_command(server_id, port_check, use_sudo=False)
+        
+        if "PORT_NOT_OPEN" in stdout and xray_ok:
+            await message.answer("⚠️ XRay работает, но порт 443 не открыт. Возможно firewall блокирует")
         
         # Обновляем базу данных
         async with aiosqlite.connect(DB_PATH) as db:
@@ -460,11 +505,13 @@ async def setup_xray_vpn(server_id: int, message: Message):
         
         if xray_ok:
             await message.answer(
-                f"✅ <b>XRay Reality успешно установлен!</b>\n\n"
+                f"✅ <b>XRay Reality успешно установлен и работает!</b>\n\n"
                 f"🌐 <b>IP сервера:</b> {server_ip}\n"
                 f"🔐 <b>Тип VPN:</b> XRay (VLESS + Reality)\n"
                 f"🔑 <b>Публичный ключ:</b> <code>{public_key}</code>\n"
-                f"🚪 <b>Порт:</b> 443\n\n"
+                f"🚪 <b>Порт:</b> 443\n"
+                f"🎯 <b>SNI:</b> google.com\n"
+                f"🔧 <b>Short ID:</b> aabbccdd\n\n"
                 f"<i>Теперь можно добавлять пользователей через админ-панель.</i>",
                 parse_mode=ParseMode.HTML
             )
@@ -475,39 +522,47 @@ async def setup_xray_vpn(server_id: int, message: Message):
                 f"🔐 <b>Тип VPN:</b> XRay (VLESS + Reality)\n"
                 f"🔑 <b>Публичный ключ:</b> <code>{public_key}</code>\n"
                 f"🚪 <b>Порт:</b> 443\n\n"
-                f"<i>Проверьте статус службы: systemctl status xray</i>",
+                f"<i>Проверьте статус службы: <code>systemctl status xray</code></i>",
                 parse_mode=ParseMode.HTML
             )
         
         return xray_ok
         
     except Exception as e:
-        await message.answer(f"❌ Ошибка установки: {str(e)[:500]}")
+        await message.answer(f"❌ Критическая ошибка установки: {str(e)[:500]}")
+        logger.error(f"Ошибка установки XRay: {e}")
         return False
 
 async def test_xray_connection(server_id: int) -> Dict:
-    """Проверка подключения XRay"""
+    """Проверка подключения XRay - ИСПРАВЛЕННАЯ"""
     try:
         # Проверяем что XRay работает
-        check_cmd = "systemctl is-active xray && echo 'XRAY_ACTIVE'"
+        check_cmd = "systemctl is-active xray 2>/dev/null && echo 'XRAY_ACTIVE' || echo 'XRAY_INACTIVE'"
         stdout, stderr, success = await execute_ssh_command(server_id, check_cmd, use_sudo=True)
         
-        if "XRAY_ACTIVE" not in stdout:
+        if "XRAY_INACTIVE" in stdout:
             # Пытаемся перезапустить
             await execute_ssh_command(server_id, "systemctl restart xray", use_sudo=True)
             await asyncio.sleep(3)
             
             stdout, stderr, success = await execute_ssh_command(server_id, check_cmd, use_sudo=True)
             
-            if "XRAY_ACTIVE" not in stdout:
+            if "XRAY_INACTIVE" in stdout:
                 return {"success": False, "message": "Служба XRay не запущена"}
         
         # Проверяем порт
-        port_check = "ss -tuln | grep ':443 ' || netstat -tuln | grep ':443 ' || echo 'PORT_NOT_OPEN'"
+        port_check = "ss -tln 2>/dev/null | grep ':443 ' || netstat -tln 2>/dev/null | grep ':443 ' || echo 'PORT_NOT_OPEN'"
         stdout, stderr, success = await execute_ssh_command(server_id, port_check, use_sudo=False)
         
         if "PORT_NOT_OPEN" in stdout:
             return {"success": False, "message": "Порт 443 не открыт"}
+        
+        # Проверяем конфиг
+        config_check = "test -f /usr/local/etc/xray/config.json && echo 'CONFIG_EXISTS' || echo 'NO_CONFIG'"
+        stdout, stderr, success = await execute_ssh_command(server_id, config_check, use_sudo=True)
+        
+        if "NO_CONFIG" in stdout:
+            return {"success": False, "message": "Конфиг XRay не найден"}
         
         return {"success": True, "message": "XRay работает корректно"}
         
@@ -515,7 +570,7 @@ async def test_xray_connection(server_id: int) -> Dict:
         return {"success": False, "message": f"Ошибка проверки: {str(e)[:200]}"}
 
 async def create_xray_user(server_id: int, user_id: int, username: str, device_type: str = "auto"):
-    """Создание пользователя XRay"""
+    """Создание пользователя XRay - ИСПРАВЛЕННАЯ"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             # Получаем данные сервера
@@ -534,7 +589,7 @@ async def create_xray_user(server_id: int, user_id: int, username: str, device_t
                 return None, "Сервер переполнен"
             
             # Генерируем UUID
-            uuid_cmd = "xray uuid"
+            uuid_cmd = "/usr/local/bin/xray uuid 2>/dev/null || xray uuid"
             stdout, stderr, success = await execute_ssh_command(server_id, uuid_cmd, use_sudo=True)
             
             if not success or not stdout:
@@ -542,29 +597,42 @@ async def create_xray_user(server_id: int, user_id: int, username: str, device_t
             
             vpn_uuid = stdout.strip()
             
-            # Добавляем пользователя в конфиг XRay
-            add_user_cmd = f"""
-                python3 -c "
-import json
-with open('/usr/local/etc/xray/config.json', 'r') as f:
-    config = json.load(f)
-    
-# Добавляем клиента в первый inbound (Reality)
-client = {{'id': '{vpn_uuid}', 'flow': 'xtls-rprx-vision'}}
-config['inbounds'][0]['settings']['clients'].append(client)
-
-with open('/usr/local/etc/xray/config.json', 'w') as f:
-    json.dump(config, f, indent=2)
-"
-            """
-            
-            stdout, stderr, success = await execute_ssh_command(server_id, add_user_cmd, use_sudo=True)
+            # Читаем текущий конфиг
+            config_cmd = "cat /usr/local/etc/xray/config.json"
+            stdout, stderr, success = await execute_ssh_command(server_id, config_cmd, use_sudo=True)
             
             if not success:
-                return None, f"Ошибка добавления пользователя в конфиг: {stderr[:200]}"
+                return None, "Не удалось прочитать конфиг XRay"
             
-            # Добавляем в users.json
-            user_data_cmd = f"""
+            try:
+                config = json.loads(stdout)
+            except:
+                return None, "Ошибка парсинга конфига XRay"
+            
+            # Добавляем клиента
+            new_client = {
+                "id": vpn_uuid,
+                "flow": "xtls-rprx-vision"
+            }
+            
+            if "inbounds" in config and len(config["inbounds"]) > 0:
+                if "settings" in config["inbounds"][0] and "clients" in config["inbounds"][0]["settings"]:
+                    config["inbounds"][0]["settings"]["clients"].append(new_client)
+                else:
+                    config["inbounds"][0]["settings"] = {"clients": [new_client], "decryption": "none"}
+            else:
+                return None, "Неверная структура конфига XRay"
+            
+            # Записываем обновленный конфиг
+            config_json = json.dumps(config, indent=2)
+            update_cmd = f"cat > /usr/local/etc/xray/config.json << 'EOF'\n{config_json}\nEOF"
+            stdout, stderr, success = await execute_ssh_command(server_id, update_cmd, use_sudo=True)
+            
+            if not success:
+                return None, f"Ошибка обновления конфига: {stderr[:200]}"
+            
+            # Обновляем users.json
+            update_users_cmd = f"""
                 python3 -c "
 import json
 try:
@@ -572,15 +640,13 @@ try:
         users = json.load(f)
 except:
     users = {{}}
-    
 users['{vpn_uuid}'] = '{username}'
-
 with open('/usr/local/etc/xray/users.json', 'w') as f:
     json.dump(users, f, indent=2)
-"
+" 2>/dev/null || echo "{{'{vpn_uuid}': '{username}'}}" > /usr/local/etc/xray/users.json
             """
             
-            await execute_ssh_command(server_id, user_data_cmd, use_sudo=True)
+            await execute_ssh_command(server_id, update_users_cmd, use_sudo=True)
             
             # Перезапускаем XRay
             await execute_ssh_command(server_id, "systemctl restart xray", use_sudo=True)
@@ -613,29 +679,38 @@ with open('/usr/local/etc/xray/users.json', 'w') as f:
 async def delete_xray_user(server_id: int, vpn_uuid: str):
     """Удаление пользователя XRay"""
     try:
-        # Удаляем из конфига
-        remove_user_cmd = f"""
-            python3 -c "
-import json
-with open('/usr/local/etc/xray/config.json', 'r') as f:
-    config = json.load(f)
-
-# Удаляем клиента
-clients = config['inbounds'][0]['settings']['clients']
-config['inbounds'][0]['settings']['clients'] = [c for c in clients if c['id'] != '{vpn_uuid}']
-
-with open('/usr/local/etc/xray/config.json', 'w') as f:
-    json.dump(config, f, indent=2)
-"
-        """
-        
-        stdout, stderr, success = await execute_ssh_command(server_id, remove_user_cmd, use_sudo=True)
+        # Читаем текущий конфиг
+        config_cmd = "cat /usr/local/etc/xray/config.json"
+        stdout, stderr, success = await execute_ssh_command(server_id, config_cmd, use_sudo=True)
         
         if not success:
-            return False, f"Ошибка удаления из конфига: {stderr[:200]}"
+            return False, "Не удалось прочитать конфиг XRay"
+        
+        try:
+            config = json.loads(stdout)
+        except:
+            return False, "Ошибка парсинга конфига XRay"
+        
+        # Удаляем клиента
+        if "inbounds" in config and len(config["inbounds"]) > 0:
+            if "settings" in config["inbounds"][0] and "clients" in config["inbounds"][0]["settings"]:
+                clients = config["inbounds"][0]["settings"]["clients"]
+                config["inbounds"][0]["settings"]["clients"] = [c for c in clients if c.get("id") != vpn_uuid]
+            else:
+                return False, "Неверная структура конфига XRay"
+        else:
+            return False, "Неверная структура конфига XRay"
+        
+        # Записываем обновленный конфиг
+        config_json = json.dumps(config, indent=2)
+        update_cmd = f"cat > /usr/local/etc/xray/config.json << 'EOF'\n{config_json}\nEOF"
+        stdout, stderr, success = await execute_ssh_command(server_id, update_cmd, use_sudo=True)
+        
+        if not success:
+            return False, f"Ошибка обновления конфига: {stderr[:200]}"
         
         # Удаляем из users.json
-        remove_data_cmd = f"""
+        remove_user_cmd = f"""
             python3 -c "
 import json
 try:
@@ -643,15 +718,13 @@ try:
         users = json.load(f)
 except:
     users = {{}}
-    
 users.pop('{vpn_uuid}', None)
-
 with open('/usr/local/etc/xray/users.json', 'w') as f:
     json.dump(users, f, indent=2)
-"
+" 2>/dev/null || true
         """
         
-        await execute_ssh_command(server_id, remove_data_cmd, use_sudo=True)
+        await execute_ssh_command(server_id, remove_user_cmd, use_sudo=True)
         
         # Перезапускаем XRay
         await execute_ssh_command(server_id, "systemctl restart xray", use_sudo=True)
@@ -798,23 +871,21 @@ async def send_xray_config_to_user(user_id: int, vpn_data: dict, message: Messag
 🔑 <b>UUID:</b> <code>{vpn_data['vpn_uuid']}</code>
 🔐 <b>Публичный ключ:</b> <code>{vpn_data['public_key']}</code>
 🚪 <b>Порт:</b> 443
-🔧 <b>Тип:</b> VLESS + Reality
+🎯 <b>SNI:</b> google.com
+🔧 <b>Short ID:</b> aabbccdd
+🔁 <b>Flow:</b> xtls-rprx-vision
 
 <b>Готовая ссылка для приложений (Hiddify, Nekobox, v2rayNG):</b>
 <code>{vpn_data['vless_link']}</code>
 
-<b>Ручная настройка:</b>
-1. Тип: VLESS
-2. Адрес: {vpn_data['server_ip']}
-3. Порт: 443
-4. ID (UUID): {vpn_data['vpn_uuid']}
-5. Зашифрование: none
-6. Сеть: tcp
-7. Тип безопасности: reality
-8. SNI: google.com
-9. Public Key: {vpn_data['public_key']}
-10. Short ID: aabbccdd
-11. Flow: xtls-rprx-vision
+<b>Как подключиться:</b>
+1. Скачайте приложение:
+   • Android: v2rayNG, Nekobox
+   • iOS: Hiddify, Foxray
+   • Windows/Mac: Nekoray, v2rayN
+2. Нажмите "Импорт" или "+"
+3. Вставьте ссылку выше
+4. Включите VPN
 
 ⚠️ <b>Сохраните эти данные!</b> Они не восстанавливаются.
 🆘 <b>Поддержка:</b> {SUPPORT_USERNAME}"""
@@ -824,7 +895,7 @@ async def send_xray_config_to_user(user_id: int, vpn_data: dict, message: Messag
     except Exception as e:
         await message.answer(f"❌ Ошибка отправки конфига: {str(e)}")
 
-# ========== КЛАВИАТУРЫ ==========
+# ========== КЛАВИАТУРЫ - УБРАН БЕЗЛИМИТ ==========
 def user_main_menu():
     return types.ReplyKeyboardMarkup(
         keyboard=[
@@ -900,7 +971,6 @@ def period_keyboard():
             [types.KeyboardButton(text="🎁 3 дня (пробный)")],
             [types.KeyboardButton(text="💎 Неделя")],
             [types.KeyboardButton(text="💎 Месяц")],
-            [types.KeyboardButton(text="♾️ Безлимит")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -911,7 +981,6 @@ def extend_period_keyboard():
         keyboard=[
             [types.KeyboardButton(text="💎 Неделя")],
             [types.KeyboardButton(text="💎 Месяц")],
-            [types.KeyboardButton(text="♾️ Безлимит")],
             [types.KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
@@ -1438,7 +1507,6 @@ async def process_issue_vpn_user(message: Message, state: FSMContext):
 📊 <b>Тарифы:</b>
 💎 <b>7 дней</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}
 💎 <b>30 дней</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}
-♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}
 
 Выберите период:"""
     
@@ -1453,8 +1521,7 @@ async def process_issue_vpn_period(message: Message, state: FSMContext):
     
     period_map = {
         "💎 Неделя": 7,
-        "💎 Месяц": 30,
-        "♾️ Безлимит": 36500
+        "💎 Месяц": 30
     }
     
     if message.text not in period_map:
@@ -1610,11 +1677,6 @@ async def admin_prices(message: Message):
 ₽ {prices['month']['rub']:.2f} RUB
 € {prices['month']['eur']:.2f} EUR
 
-<b>Безлимит (100 лет):</b>
-💎 {prices['unlimited']['stars']} Stars
-₽ {prices['unlimited']['rub']:.2f} RUB
-€ {prices['unlimited']['eur']:.2f} EUR
-
 Для изменения цен используйте кнопку ниже:"""
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=prices_menu())
@@ -1636,8 +1698,7 @@ async def admin_change_price_start(message: Message, state: FSMContext):
 
 <b>Пример:</b> <code>50, 500.0, 5.0</code>
 
-<b>Месячная цена будет рассчитана автоматически (×3)</b>
-<b>Безлимит будет рассчитан автоматически (×6)</b>"""
+<b>Месячная цена будет рассчитана автоматически (×3)</b>"""
     
     await state.set_state(PriceStates.waiting_for_prices)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
@@ -1680,12 +1741,7 @@ async def process_new_prices(message: Message, state: FSMContext):
 <b>Новая цена за месяц (неделя×3):</b>
 💎 {new_prices['month']['stars']} Stars
 ₽ {new_prices['month']['rub']:.2f} RUB
-€ {new_prices['month']['eur']:.2f} EUR
-
-<b>Новая цена за безлимит (неделя×6):</b>
-💎 {new_prices['unlimited']['stars']} Stars
-₽ {new_prices['unlimited']['rub']:.2f} RUB
-€ {new_prices['unlimited']['eur']:.2f} EUR"""
+€ {new_prices['month']['eur']:.2f} EUR"""
             
             await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=admin_main_menu())
         else:
@@ -1847,7 +1903,6 @@ async def user_extend_subscription_start(message: Message, state: FSMContext):
             prices = await get_vpn_prices()
             text += f"\n\n💎 <b>Неделя (7 дней)</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}"
             text += f"\n💎 <b>Месяц (30 дней)</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}"
-            text += f"\n♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}"
             
             await state.set_state(UserPaymentStates.waiting_for_period)
             await state.update_data(is_extension=True)
@@ -1896,7 +1951,6 @@ async def process_extend_user(message: Message, state: FSMContext):
 📊 <b>Тарифы:</b>
 💎 <b>7 дней</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}
 💎 <b>30 дней</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}
-♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}
 
 Выберите период продления:"""
     
@@ -1911,8 +1965,7 @@ async def process_extend_period(message: Message, state: FSMContext):
     
     period_map = {
         "💎 Неделя": 7,
-        "💎 Месяц": 30,
-        "♾️ Безлимит": 36500
+        "💎 Месяц": 30
     }
     
     if message.text not in period_map:
@@ -1965,7 +2018,6 @@ async def get_vpn_start(message: Message, state: FSMContext):
 🎁 <b>3 дня бесплатно</b> - пробный период
 💎 <b>7 дней</b> - {prices['week']['stars']} Stars / ₽{prices['week']['rub']:.2f} / €{prices['week']['eur']:.2f}
 💎 <b>30 дней</b> - {prices['month']['stars']} Stars / ₽{prices['month']['rub']:.2f} / €{prices['month']['eur']:.2f}
-♾️ <b>Безлимит</b> - {prices['unlimited']['stars']} Stars / ₽{prices['unlimited']['rub']:.2f} / €{prices['unlimited']['eur']:.2f}
 
 Выберите вариант:"""
     
@@ -2000,11 +2052,10 @@ async def process_user_period(message: Message, state: FSMContext):
         await state.set_state(UserPaymentStates.waiting_for_device)
         await message.answer("✅ Пробный период доступен!\n\n📱 Выберите тип вашего устройства:", reply_markup=device_type_keyboard())
         
-    elif message.text in ["💎 Неделя", "💎 Месяц", "♾️ Безлимит"]:
+    elif message.text in ["💎 Неделя", "💎 Месяц"]:
         period_map = {
             "💎 Неделя": 7,
-            "💎 Месяц": 30,
-            "♾️ Безлимит": 36500
+            "💎 Месяц": 30
         }
         
         period = period_map[message.text]
@@ -2012,10 +2063,8 @@ async def process_user_period(message: Message, state: FSMContext):
         
         if period == 7:
             price_key = "week"
-        elif period == 30:
-            price_key = "month"
         else:
-            price_key = "unlimited"
+            price_key = "month"
         
         amount_stars = prices[price_key]['stars']
         amount_rub = prices[price_key]['rub']
@@ -2403,16 +2452,19 @@ async def periodic_tasks():
 # ========== ЗАПУСК ==========
 async def main():
     print("=" * 50)
-    print("🚀 ЗАПУСК VPN БОТА С XRAY REALITY")
+    print("🚀 ЗАПУСК VPN БОТА С XRAY REALITY (ИСПРАВЛЕННАЯ ВЕРСИЯ)")
     print("=" * 50)
     print(f"🔐 Протокол: XRay Reality (VLESS)")
     print(f"💳 Оплата: Stars, RUB, EUR")
     print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"💬 Support: {SUPPORT_USERNAME}")
     
+    # Инициализация БД
+    print("🔧 Инициализация базы данных...")
     if not await init_database():
         print("❌ Не удалось инициализировать базу данных!")
         return
+    print("✅ База данных готова")
     
     try:
         me = await bot.get_me()
